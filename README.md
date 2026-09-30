@@ -1,0 +1,290 @@
+# MoM — Meeting Intelligence
+
+Upload or record a meeting and get a **speaker-labelled transcript**, an optional **English translation** (for Hindi / Marathi), and **LLM-written minutes** (Summary, Key Points, Decisions, Action Items).
+
+Each participant enrolls their voice once; after that the app recognises who said what automatically.
+
+---
+
+## Features
+
+- **Voice enrollment** — upload a 5–30 s sample or record one in the browser
+- **Automatic speaker recognition** — transcript lines are labelled with enrolled names
+- **Multilingual** — English, Hindi, Marathi (Devanagari), with side-by-side English translation
+- **Per-speaker language** — each enrolled voice gets an auto-detected language (EN / HI / MR)
+- **Upload or live record** a meeting straight from the browser mic
+- **Click ▶ on any line** to replay that moment of the meeting
+- **Name unknown speakers** from the transcript — their voice is enrolled from that meeting
+- **Save meetings** to a sidebar, **export PDF**, dark / light theme, live progress bar
+
+---
+
+## How it works
+
+```
+Meeting audio
+  → normalise to 16 kHz mono WAV         (librosa / ffmpeg)
+  → pyannote 3.1 diarization             who spoke when (SPEAKER_00, SPEAKER_01 …)
+  → SpeechBrain ECAPA embedding          voice fingerprint per speaker
+  → ChromaDB cosine match                fingerprint → enrolled name (or "Unknown")
+  → faster-whisper large-v3              speech-to-text for every speaker turn
+  → GPT polish      (optional)           fix Hindi/Marathi recognition errors
+  → GPT translate   (optional)           Hindi/Marathi → natural English
+  → GPT summary     (optional)           meeting minutes
+```
+
+Diarization, speaker embeddings and Whisper run **locally**. Only the polish / translate / summary steps call OpenAI or Azure OpenAI.
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.11, FastAPI, Uvicorn |
+| Diarization | `pyannote/speaker-diarization-3.1` |
+| Speaker embeddings | `speechbrain/spkrec-ecapa-voxceleb` (ECAPA-TDNN) |
+| Speech-to-text | Whisper `large-v3` via `faster-whisper` |
+| Vector DB | ChromaDB (local, file-based) |
+| LLM | OpenAI or Azure OpenAI (GPT-4o / GPT-4o-mini) |
+| Frontend | Single `index.html` — plain HTML/CSS/JS, jsPDF (no build step) |
+
+---
+
+## Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| **Python 3.11** (3.10 also works) | **Not** 3.12 / 3.13 — torch / pyannote versions used here don't support them |
+| **ffmpeg** on `PATH` | Needed to read MP3 / M4A / WebM |
+| **8 GB+ RAM** | Whisper `large-v3` is memory-hungry |
+| **~10 GB free disk** | ~2 GB packages + ~5 GB models (downloaded on first use) |
+| **HuggingFace account** | Free — for the pyannote models |
+| **OpenAI or Azure OpenAI key** | For polish / translation / summary |
+| NVIDIA GPU (optional) | ~10× faster transcription |
+
+---
+
+## Setup (first time)
+
+### 1. Clone the repository
+
+```bash
+git clone <repo-url>
+cd <repo-folder>
+```
+
+### 2. Install ffmpeg
+
+- **Windows:** `winget install Gyan.FFmpeg` (then open a **new** terminal)
+- **macOS:** `brew install ffmpeg`
+- **Ubuntu / Debian:** `sudo apt install ffmpeg`
+
+Check it works: `ffmpeg -version`
+
+### 3. Create and activate a virtual environment
+
+**Windows (PowerShell):**
+
+```powershell
+py -3.11 -m venv venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # allow the activate script in this window
+.\venv\Scripts\Activate.ps1
+python --version                                             # must print 3.11.x
+```
+
+> If you have several Pythons installed, plain `py` / `python` may pick 3.12 or 3.13. Always use `py -3.11`.
+
+**macOS / Linux:**
+
+```bash
+python3.11 -m venv venv
+source venv/bin/activate
+python --version
+```
+
+### 4. Install Python dependencies
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Downloads ~2 GB (PyTorch, pyannote, Whisper, SpeechBrain). Takes 10–20 minutes.
+
+### 5. Get a HuggingFace token
+
+1. Sign up at https://huggingface.co
+2. Create a **Read** token: https://huggingface.co/settings/tokens
+3. Open both pages below while logged in and click **Agree / Accept** on each:
+   - https://huggingface.co/pyannote/speaker-diarization-3.1
+   - https://huggingface.co/pyannote/segmentation-3.0
+
+### 6. Create your `.env`
+
+```bash
+# Windows
+copy .env.example .env
+# macOS / Linux
+cp .env.example .env
+```
+
+Open `.env` and fill in:
+
+- `HF_TOKEN` — token from step 5
+- **One** LLM provider:
+  - **OpenAI:** set `OPENAI_API_KEY=sk-...`
+  - **Azure OpenAI:** uncomment the `AZURE_OPENAI_*` block and fill endpoint, key and deployment names
+
+Everything else has working defaults. `.env` is git-ignored — **never commit it**.
+
+---
+
+## Run
+
+```bash
+# Windows — activate the venv first if it isn't already
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+
+python run.py
+```
+
+Open **http://localhost:8000** in Chrome or Edge.
+
+On startup the console prints a **preflight report** checking Python, ffmpeg, folders, tokens, packages, the speaker DB and a live LLM call:
+
+```
+========================================================================
+Result: 11 passed
+All systems ready — process a meeting to test end-to-end.
+========================================================================
+```
+
+Any ✗ line comes with a suggested fix. Stop the server with `Ctrl+C`.
+
+VS Code users can also press **F5** (config in `.vscode/launch.json`).
+
+> **First run is slow:** models (~5 GB) download the first time you enroll a voice / process a meeting. They are cached in `~/.cache/huggingface/` afterwards.
+
+---
+
+## Using the app
+
+1. **Enroll voices** (left sidebar) — type a name, upload or record a clean 5–30 s sample, click **Enroll voice**. The person appears in *Enrolled voices* with a language chip.
+2. **Process a meeting** — choose **Upload file** (MP3 / WAV / M4A / WebM) or **Live meeting** (record from mic; processing starts when you stop). Pick the language (Auto / English / Hindi / Marathi), toggle *Summary* and *English translation*, click **Process meeting**.
+3. **Review** — each line shows speaker, time and text (plus English translation). Click ▶ to hear that moment.
+4. **Name unknown speakers** — click an *Unknown (SPEAKER_02)* label, type the real name; their voice is enrolled from this meeting and recognised in future meetings.
+5. **Save / export** — **Save meeting** stores it in the sidebar; **PDF** downloads a report.
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HF_TOKEN` | — | **Required.** HuggingFace token for pyannote |
+| `OPENAI_API_KEY` | — | OpenAI key (or Azure key if `AZURE_OPENAI_API_KEY` not set) |
+| `AZURE_OPENAI_ENDPOINT` | — | Setting this switches the app to Azure OpenAI |
+| `AZURE_OPENAI_API_KEY` | — | Azure key |
+| `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Azure API version |
+| `AZURE_OPENAI_DEPLOYMENT_TRANSLATE / _POLISH / _SUMMARY` | — | Azure deployment names (can all be the same) |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Summary model (OpenAI only) |
+| `GPT_POLISH_MODEL` | `gpt-4o-mini` | Polish model (OpenAI only) |
+| `GPT_TRANSLATE_MODEL` | `gpt-4o` | Translation model (OpenAI only) |
+| `WHISPER_MODEL` | `large-v3` | `tiny` / `base` / `small` / `medium` / `large-v3` |
+| `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` |
+| `WHISPER_COMPUTE_TYPE` | `int8` | `int8` for CPU, `float16` for GPU |
+| `WHISPER_BEAM_SIZE` | `5` | Higher = more accurate, slower |
+| `WHISPER_MODEL_MR` / `WHISPER_MODEL_HI` | empty | Optional HuggingFace model id for Marathi / Hindi |
+| `POLISH_TRANSCRIPT` | `false` | `true` = GPT fixes Hindi/Marathi recognition errors |
+| `SPEAKER_MATCH_THRESHOLD` | `0.35` | Cosine distance; lower = stricter matching |
+| `CHROMA_DIR`, `UPLOAD_DIR`, `ENROLL_DIR`, `MEETINGS_DIR` | `./data/...` | Storage folders (auto-created) |
+
+---
+
+## Project structure
+
+```
+app/
+  main.py            FastAPI routes, background job tracking, static frontend
+  pipeline.py        End-to-end meeting processing (diarize → match → transcribe → polish → translate)
+  diarization.py     pyannote wrapper
+  embeddings.py      SpeechBrain ECAPA voice embeddings (+ Windows symlink workaround)
+  speaker_db.py      ChromaDB storage and speaker matching
+  transcription.py   faster-whisper / HF transformers STT, GPT polish + translate prompts
+  summarizer.py      GPT meeting-minutes prompt
+  llm_client.py      Shared OpenAI / Azure OpenAI client
+  audio_utils.py     Load / slice / save audio (16 kHz mono)
+  config.py          Reads .env, defines paths
+  startup_check.py   Preflight health report printed at boot
+frontend/
+  index.html         Entire UI (HTML + CSS + JS in one file)
+data/                Runtime data — auto-created, git-ignored (voices, meetings, DB)
+run.py               Starts Uvicorn on http://localhost:8000
+requirements.txt     Pinned Python dependencies
+.env.example         Configuration template (copy to .env)
+```
+
+---
+
+## API reference
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/health` | Health check |
+| `GET` | `/api/speakers` | List enrolled voices |
+| `POST` | `/api/enroll` | Form: `name`, `audio` — enroll a voice |
+| `POST` | `/api/enroll_from_meeting` | JSON: `name`, `audio_id`, `ranges` — enroll from a processed meeting |
+| `DELETE` | `/api/speakers/{id}` | Remove an enrolled voice |
+| `GET` | `/api/speakers/{id}/audio` | Stream enrolled voice sample |
+| `POST` | `/api/process` | Form: `audio`, `do_summary`, `language`, `translate` — returns `job_id` |
+| `GET` | `/api/jobs/{id}` | Poll job progress / result |
+| `GET` | `/api/meetings` | List saved meetings |
+| `POST` | `/api/meetings/save` | Save a processed meeting |
+| `GET` | `/api/meetings/{id}/data` | Load a saved meeting |
+| `DELETE` | `/api/meetings/{id}` | Delete a saved meeting |
+| `GET` | `/api/meetings/{audio_id}/audio` | Stream meeting audio |
+
+Interactive docs: http://localhost:8000/docs
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `Activate.ps1 cannot be loaded … running scripts is disabled` | Run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first |
+| `torch` DLL error / pip can't build wheels | venv is on Python 3.12+. Delete `venv`, recreate with `py -3.11 -m venv venv` |
+| `HF_TOKEN is not set` / 401 from HuggingFace | Add token to `.env` and accept both pyannote model pages |
+| `ffmpeg not found` / can't load audio | Install ffmpeg, open a new terminal |
+| Preflight `LLM API reachable` fails with 401 | Key doesn't belong to that endpoint / resource |
+| Preflight fails with 404 `DeploymentNotFound` | `AZURE_OPENAI_DEPLOYMENT_*` doesn't match a deployment name in Azure |
+| First meeting is very slow | Models are downloading (~5 GB) — one-time |
+| Processing is slow on CPU | Set `WHISPER_MODEL=medium`, or use a GPU (`WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`) |
+| Everyone shows as "Unknown" | Raise `SPEAKER_MATCH_THRESHOLD` to `0.45` or re-enroll with a longer, cleaner sample |
+| Names get mixed up | Lower `SPEAKER_MATCH_THRESHOLD` to `0.25` |
+| Poor Marathi / Hindi text | Set `POLISH_TRANSCRIPT=true`; improve audio quality |
+| "Failed to fetch" during processing | Don't run Uvicorn with `--reload` (file writes restart the server) |
+| Mic recording doesn't work on another machine | Browsers only allow the mic on `localhost` or HTTPS |
+
+---
+
+## Known limitations
+
+This is an internal demo, **not production-hardened**:
+
+- No authentication — anyone who can reach the server has full access (it binds to `0.0.0.0`)
+- Single shared speaker database (no multi-user isolation)
+- Jobs are kept in memory — lost if the server restarts
+- Uploaded audio is never cleaned up automatically
+- PDF export uses a Latin font, so Devanagari text doesn't render correctly in the PDF
+- Very long meetings may exceed LLM context limits for polish / translate / summary
+
+---
+
+## Security notes
+
+- **Never commit `.env`** — it holds your HuggingFace and OpenAI / Azure keys. It is already in `.gitignore`.
+- The `data/` folder contains **voice recordings and meeting transcripts (personal data)** and is git-ignored. Don't share it.
+- If a key is ever pushed by mistake, **revoke / regenerate it immediately** — deleting the commit is not enough.
