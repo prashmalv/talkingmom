@@ -22,18 +22,25 @@ Each participant enrolls their voice once; after that the app recognises who sai
 ## How it works
 
 ```
-Meeting audio
-  → normalise to 16 kHz mono WAV         (librosa / ffmpeg)
-  → pyannote 3.1 diarization             who spoke when (SPEAKER_00, SPEAKER_01 …)
-  → SpeechBrain ECAPA embedding          voice fingerprint per speaker
-  → ChromaDB cosine match                fingerprint → enrolled name (or "Unknown")
-  → faster-whisper large-v3              speech-to-text for every speaker turn
-  → GPT polish      (optional)           fix Hindi/Marathi recognition errors
-  → GPT translate   (optional)           Hindi/Marathi → natural English
-  → GPT summary     (optional)           meeting minutes
+Meeting audio → normalise to 16 kHz mono WAV (librosa / ffmpeg)
+  ├─ in parallel ─ faster-whisper, ONE pass over the whole file, word timestamps
+  │                (English → `small`, Hindi/Marathi → `large-v3`; names given as vocabulary)
+  └─ pyannote 3.1 diarization → who spoke when (SPEAKER_00, SPEAKER_01 …)
+       → overlaps removed (each moment belongs to one speaker)
+       → SpeechBrain ECAPA voice fingerprint per label AND per turn
+       → ChromaDB cosine match → enrolled name (or "Unknown")
+  → each word goes to the speaker turn it was spoken in
+  → GPT polish      (optional)  fix mis-heard words, all languages
+  → GPT translate   (optional)  Hindi/Marathi → natural English
+  → GPT summary     (optional)  meeting minutes
 ```
 
 Diarization, speaker embeddings and Whisper run **locally**. Only the polish / translate / summary steps call OpenAI or Azure OpenAI.
+
+**Why it's built this way**
+- **One Whisper pass, not one per turn.** Whisper pads every call to a 30 s window, so transcribing 2 s turns one at a time costs ~15× more. A single pass also gives Whisper the conversation's context, which improves word accuracy.
+- **Every turn is identified by its own voice.** pyannote sometimes gives two people the same label (or one person two labels). A turn of 1.5 s or longer whose voice clearly matches a different enrolled person overrides its label.
+- **Mixed-language meetings (Auto).** If a speaker's enrolled language differs from the meeting's, their turns are checked with language detection and re-transcribed in their language only when the audio confirms it.
 
 ---
 
@@ -44,7 +51,7 @@ Diarization, speaker embeddings and Whisper run **locally**. Only the polish / t
 | Backend | Python 3.11, FastAPI, Uvicorn |
 | Diarization | `pyannote/speaker-diarization-3.1` |
 | Speaker embeddings | `speechbrain/spkrec-ecapa-voxceleb` (ECAPA-TDNN) |
-| Speech-to-text | Whisper `large-v3` via `faster-whisper` |
+| Speech-to-text | Whisper via `faster-whisper` — `small` for English, `large-v3` for Hindi / Marathi |
 | Vector DB | ChromaDB (local, file-based) |
 | LLM | OpenAI or Azure OpenAI (GPT-4o / GPT-4o-mini) |
 | Frontend | Single `index.html` — plain HTML/CSS/JS, jsPDF (no build step) |
@@ -172,7 +179,7 @@ VS Code users can also press **F5** (config in `.vscode/launch.json`).
 ## Using the app
 
 1. **Enroll voices** (left sidebar) — type a name, upload or record a clean 5–30 s sample, click **Enroll voice**. The person appears in *Enrolled voices* with a language chip.
-2. **Process a meeting** — choose **Upload file** (MP3 / WAV / M4A / WebM) or **Live meeting** (record from mic; processing starts when you stop). Pick the language (Auto / English / Hindi / Marathi), toggle *Summary* and *English translation*, click **Process meeting**.
+2. **Process a meeting** — choose **Upload file** (MP3 / WAV / M4A / WebM) or **Live meeting** (record from mic; processing starts when you stop). Pick the language (Auto / English / Hindi / Marathi — a specific language is applied to everyone; choose **Auto** for mixed-language meetings), toggle *Summary* and *English translation*, click **Process meeting**.
 3. **Review** — each line shows speaker, time and text (plus English translation). Click ▶ to hear that moment.
 4. **Name unknown speakers** — click an *Unknown (SPEAKER_02)* label, type the real name; their voice is enrolled from this meeting and recognised in future meetings.
 5. **Save / export** — **Save meeting** stores it in the sidebar; **PDF** downloads a report.
@@ -192,13 +199,17 @@ VS Code users can also press **F5** (config in `.vscode/launch.json`).
 | `OPENAI_MODEL` | `gpt-4o-mini` | Summary model (OpenAI only) |
 | `GPT_POLISH_MODEL` | `gpt-4o-mini` | Polish model (OpenAI only) |
 | `GPT_TRANSLATE_MODEL` | `gpt-4o` | Translation model (OpenAI only) |
-| `WHISPER_MODEL` | `large-v3` | `tiny` / `base` / `small` / `medium` / `large-v3` |
+| `WHISPER_MODEL` | `large-v3` | Main model (used for Hindi / Marathi): `tiny` / `base` / `small` / `medium` / `large-v3` |
+| `WHISPER_MODEL_EN` | empty (`.env.example`: `small`) | Model for English; in Auto mode it also detects the language. Blank = use `WHISPER_MODEL` |
 | `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` |
 | `WHISPER_COMPUTE_TYPE` | `int8` | `int8` for CPU, `float16` for GPU |
 | `WHISPER_BEAM_SIZE` | `5` | Higher = more accurate, slower |
+| `WHISPER_CPU_THREADS` | `0` | CPU threads for Whisper; `0` = all cores |
 | `WHISPER_MODEL_MR` / `WHISPER_MODEL_HI` | empty | Optional HuggingFace model id for Marathi / Hindi |
-| `POLISH_TRANSCRIPT` | `false` | `true` = GPT fixes Hindi/Marathi recognition errors |
-| `SPEAKER_MATCH_THRESHOLD` | `0.35` | Cosine distance; lower = stricter matching |
+| `POLISH_TRANSCRIPT` | `false` | `true` = GPT fixes mis-heard words in every language, using context and enrolled names |
+| `DIARIZATION_STEP` | `0.5` | pyannote window step (fraction of 10 s). `0.1` = pyannote default, ~5× slower on CPU |
+| `SPEAKER_MATCH_THRESHOLD` | `0.45` | Cosine distance; lower = stricter matching |
+| `SPEAKER_MATCH_MARGIN` | `0.08` | How clearly a single turn's voice must beat the runner-up to override its diarization label |
 | `CHROMA_DIR`, `UPLOAD_DIR`, `ENROLL_DIR`, `MEETINGS_DIR` | `./data/...` | Storage folders (auto-created) |
 
 ---
@@ -261,10 +272,11 @@ Interactive docs: http://localhost:8000/docs
 | Preflight `LLM API reachable` fails with 401 | Key doesn't belong to that endpoint / resource |
 | Preflight fails with 404 `DeploymentNotFound` | `AZURE_OPENAI_DEPLOYMENT_*` doesn't match a deployment name in Azure |
 | First meeting is very slow | Models are downloading (~5 GB) — one-time |
-| Processing is slow on CPU | Set `WHISPER_MODEL=medium`, or use a GPU (`WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`) |
-| Everyone shows as "Unknown" | Raise `SPEAKER_MATCH_THRESHOLD` to `0.45` or re-enroll with a longer, cleaner sample |
-| Names get mixed up | Lower `SPEAKER_MATCH_THRESHOLD` to `0.25` |
-| Poor Marathi / Hindi text | Set `POLISH_TRANSCRIPT=true`; improve audio quality |
+| Processing is slow on CPU | Plug in the laptop (battery mode throttles the CPU). Check `WHISPER_MODEL_EN=small` and `DIARIZATION_STEP=0.5`. For Hindi/Marathi try `WHISPER_MODEL=medium`, or use a GPU (`WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`) |
+| A person shows as "Unknown" | Raise `SPEAKER_MATCH_THRESHOLD` (e.g. `0.5`) or re-enroll with a longer sample recorded on the same mic you use for meetings |
+| Names get mixed up | Lower `SPEAKER_MATCH_THRESHOLD` (e.g. `0.35`) or raise `SPEAKER_MATCH_MARGIN` |
+| Lines show a wrong language / script (e.g. Urdu) | Choose the meeting language explicitly instead of Auto, or re-enroll that person speaking their usual language |
+| Mis-heard words | Set `POLISH_TRANSCRIPT=true`; enroll participants (their names are used as vocabulary); improve audio quality |
 | "Failed to fetch" during processing | Don't run Uvicorn with `--reload` (file writes restart the server) |
 | Mic recording doesn't work on another machine | Browsers only allow the mic on `localhost` or HTTPS |
 

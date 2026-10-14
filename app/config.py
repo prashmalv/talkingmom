@@ -44,16 +44,27 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")           # cpu | cuda
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 (fast, CPU), int8_float16, float16 (GPU)
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+# CPU threads for Whisper; 0 = use all logical cores.
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 # Optional per-language model overrides — set to a HF model id to use a fine-tuned model.
 # e.g. WHISPER_MODEL_MR=/whisvasista22per-marathi-medium
 WHISPER_MODEL_MR = os.getenv("WHISPER_MODEL_MR", "").strip()
 WHISPER_MODEL_HI = os.getenv("WHISPER_MODEL_HI", "").strip()
+# Model for English speech. `small` is ~4x faster than large-v3 on CPU with
+# near-identical English text; blank = use WHISPER_MODEL.
+WHISPER_MODEL_EN = os.getenv("WHISPER_MODEL_EN", "").strip()
+# pyannote sliding-window step as a fraction of its 10 s window. 0.1 is the
+# pyannote default (very slow on CPU); 0.5 is ~5x faster.
+DIARIZATION_STEP = float(os.getenv("DIARIZATION_STEP", "0.5"))
 POLISH_TRANSCRIPT = os.getenv("POLISH_TRANSCRIPT", "false").strip().lower() in ("1", "true", "yes")
 
 # Separate models for polish (cheap) vs translation (quality).
 GPT_POLISH_MODEL = os.getenv("GPT_POLISH_MODEL", "gpt-4o-mini")
 GPT_TRANSLATE_MODEL = os.getenv("GPT_TRANSLATE_MODEL", "gpt-4o")
-SPEAKER_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.35"))
+SPEAKER_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.45"))
+# A single turn may override its diarization label only if its voice beats
+# the runner-up enrolled person by at least this much (cosine distance).
+SPEAKER_MATCH_MARGIN = float(os.getenv("SPEAKER_MATCH_MARGIN", "0.08"))
 
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", BASE_DIR / "data" / "chroma"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", BASE_DIR / "data" / "uploads"))

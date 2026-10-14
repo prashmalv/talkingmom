@@ -1460,14 +1460,23 @@ function playSegment(audioId, start, end, btn) {
   currentAudio = audio; currentBtn = btn; currentIco = PLAY_ICO;
   btn.classList.add('playing');
   btn.innerHTML = STOP_ICO;
+  audio.preload = 'auto';
   audio.onerror = () => { toast('Could not play segment', 'err'); stopCurrentAudio(); };
   audio.onloadedmetadata = () => {
-    try { audio.currentTime = start; } catch (e) {}
-    audio.play().catch(() => { toast('Could not play segment', 'err'); stopCurrentAudio(); });
-    segEndWatcher = setInterval(() => {
-      if (!currentAudio) return;
-      if (currentAudio.currentTime >= end) stopCurrentAudio();
-    }, 100);
+    // Only start once the seek has landed — playing before 'seeked' fires
+    // starts from 0:00 and plays earlier speakers' audio first.
+    const startPlayback = () => {
+      audio.onseeked = null;
+      if (currentAudio !== audio) return;
+      audio.play().catch(() => { toast('Could not play segment', 'err'); stopCurrentAudio(); });
+      segEndWatcher = setInterval(() => {
+        if (currentAudio !== audio) return;
+        if (audio.currentTime >= end) stopCurrentAudio();
+      }, 50);
+    };
+    if (start <= 0.05) { startPlayback(); return; }
+    audio.onseeked = startPlayback;
+    audio.currentTime = start;
   };
   audio.onended = () => stopCurrentAudio();
 }
@@ -1479,6 +1488,8 @@ const PHASE_STEP = {
   loading: 'upload',
   diarization: 'transcription',
   transcription: 'transcription',
+  polishing: 'finalizing',
+  translation: 'finalizing',
   summary: 'finalizing',
   finalizing: 'finalizing',
   done: 'finalizing',
@@ -1487,7 +1498,9 @@ const PHASE_TITLE = {
   upload: 'Uploading',
   loading: 'Loading audio',
   diarization: 'Detecting speakers',
-  transcription: 'Transcribing',
+  transcription: 'Transcribing & identifying speakers',
+  polishing: 'Correcting words',
+  translation: 'Translating',
   summary: 'Writing summary',
   finalizing: 'Finalizing',
   done: 'Done',
@@ -1714,9 +1727,10 @@ async function renameUnknownSpeaker(rawSpeaker, currentLabel) {
   const name = prompt(`Name this speaker (currently "${currentLabel}"):`, '');
   if (!name || !name.trim()) return;
   const trimmed = name.trim();
-  const ranges = lastResult.segments
-    .filter(s => s.raw_speaker === rawSpeaker)
-    .map(s => [s.start, s.end]);
+  // Match on the displayed label too: one diarization label can contain turns
+  // that were identified as an enrolled person.
+  const isThis = s => s.raw_speaker === rawSpeaker && s.speaker === currentLabel;
+  const ranges = lastResult.segments.filter(isThis).map(s => [s.start, s.end]);
   if (!ranges.length) { toast('No segments found for this speaker', 'err'); return; }
   try {
     const r = await fetch('/api/enroll_from_meeting', {
@@ -1727,7 +1741,7 @@ async function renameUnknownSpeaker(rawSpeaker, currentLabel) {
     if (!r.ok) throw new Error(await r.text());
     // Update all segments and re-render.
     for (const s of lastResult.segments) {
-      if (s.raw_speaker === rawSpeaker) s.speaker = trimmed;
+      if (isThis(s)) s.speaker = trimmed;
     }
     lastResult.transcript = lastResult.segments.map(s => `${s.speaker}: ${s.text}`).join('\n');
     // Mark as unsaved so user can re-save with the corrected names.

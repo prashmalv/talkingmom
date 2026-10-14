@@ -24,13 +24,16 @@ from .config import (
     POLISH_TRANSCRIPT,
     WHISPER_BEAM_SIZE,
     WHISPER_COMPUTE_TYPE,
+    WHISPER_CPU_THREADS,
     WHISPER_DEVICE,
     WHISPER_MODEL,
+    WHISPER_MODEL_EN,
     WHISPER_MODEL_HI,
     WHISPER_MODEL_MR,
 )
 
 _LANG_MODEL_OVERRIDES = {
+    "en": WHISPER_MODEL_EN,
     "mr": WHISPER_MODEL_MR,
     "hi": WHISPER_MODEL_HI,
 }
@@ -43,6 +46,7 @@ print("=" * 70, flush=True)
 print(f"[STT config] Default model:      {WHISPER_MODEL}", flush=True)
 print(f"[STT config] Device / compute:   {WHISPER_DEVICE} / {WHISPER_COMPUTE_TYPE}", flush=True)
 print(f"[STT config] Beam size:          {WHISPER_BEAM_SIZE}", flush=True)
+print(f"[STT config] English model:      {WHISPER_MODEL_EN or '(none — uses default)'}", flush=True)
 print(f"[STT config] Marathi override:   {WHISPER_MODEL_MR or '(none — uses default)'}", flush=True)
 print(f"[STT config] Hindi override:     {WHISPER_MODEL_HI or '(none — uses default)'}", flush=True)
 print(f"[STT config] Translation model:  {GPT_TRANSLATE_MODEL if OPENAI_API_KEY else 'Whisper translate task'}", flush=True)
@@ -80,11 +84,17 @@ _HALLUCINATION_RE = re.compile(
 
 
 def _clean(text: str) -> str:
+    """Drop text that is *entirely* a known silence-hallucination.
+
+    Only whole-text matches are removed, so real speech such as
+    "Thank you, that helps" is kept.
+    """
     if not text:
         return ""
-    text = _HALLUCINATION_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip(" .,-—")
-    return text.strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if _HALLUCINATION_RE.fullmatch(text.strip(" .,!-—")):
+        return ""
+    return text.strip(" ,-—")
 
 
 def _is_hf_only(model_id: str) -> bool:
@@ -96,7 +106,8 @@ def _is_hf_only(model_id: str) -> bool:
 @lru_cache(maxsize=4)
 def _load_fw(model_id: str) -> WhisperModel:
     print(f"[STT] Loading faster-whisper model: {model_id} (device={WHISPER_DEVICE}, compute={WHISPER_COMPUTE_TYPE})", flush=True)
-    m = WhisperModel(model_id, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+    m = WhisperModel(model_id, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE,
+                     cpu_threads=WHISPER_CPU_THREADS)
     print(f"[STT] ✓ Loaded faster-whisper: {model_id}", flush=True)
     return m
 
@@ -197,6 +208,75 @@ def _run(wav: np.ndarray, language: str | None, task: str) -> str:
     return _clean(text)
 
 
+def _vocab_prompt(names: list[str] | None) -> str:
+    # Whisper copies the style of the prompt: a punctuated sentence keeps
+    # casing/punctuation on, and listing names makes it spell them correctly.
+    base = "Hello everyone, welcome to the meeting. Okay, let's get started."
+    if names:
+        base = f"Participants: {', '.join(names[:30])}. " + base
+    return base
+
+
+def transcribe_words(
+    wav: np.ndarray, language: str | None = None, names: list[str] | None = None
+) -> tuple[list[dict], str | None] | None:
+    """Transcribe the whole recording in one pass with word timestamps.
+
+    One pass is far faster than per-turn calls (every call pads to a 30 s
+    window) and gives Whisper the surrounding context, which improves words.
+    Returns (words, detected_language), or None if the configured model for
+    this language can't do word timestamps (HF-only override) — the caller
+    then falls back to per-turn transcription.
+    """
+    audio = wav.astype(np.float32)
+    lang = language if language and language != "auto" else None
+
+    def _start(model_id: str, lang_: str | None):
+        # transcribe() detects the language eagerly; segments decode lazily.
+        return _load_fw(model_id).transcribe(
+            audio,
+            language=lang_,
+            task="transcribe",
+            beam_size=WHISPER_BEAM_SIZE,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
+            initial_prompt=_vocab_prompt(names),
+            condition_on_previous_text=True,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.6,
+        )
+
+    if lang is None and WHISPER_MODEL_EN and not _is_hf_only(WHISPER_MODEL_EN):
+        # Auto: let the fast English model detect the language. If it's
+        # English, it does the whole job; otherwise hand off to the right model.
+        model_id = WHISPER_MODEL_EN
+        segments, info = _start(model_id, None)
+        if info.language != "en":
+            lang = info.language
+            model_id = get_model_id(lang)
+            if _is_hf_only(model_id):
+                return None
+            segments, info = _start(model_id, lang)
+    else:
+        model_id = get_model_id(lang)
+        if _is_hf_only(model_id):
+            return None
+        segments, info = _start(model_id, lang)
+
+    words: list[dict] = []
+    for seg in segments:
+        if _clean(seg.text) == "":
+            continue  # whole segment is a silence-hallucination
+        for w in seg.words or []:
+            if w.word.strip():
+                words.append({"start": float(w.start), "end": float(w.end), "word": w.word})
+    print(f"[STT] whole-file: lang={lang or info.language} → faster-whisper [{model_id}], {len(words)} words", flush=True)
+    return words, (lang or getattr(info, "language", None))
+
+
 def transcribe_segment(wav: np.ndarray, language: str | None = None) -> str:
     return _run(wav, language, task="transcribe")
 
@@ -287,7 +367,8 @@ _POLISH_SYS = (
     "RULES:\n"
     "1. Output the corrected {src} lines with the SAME numbering — [1], [2], ...\n"
     "2. Keep the language as {src}. Do NOT translate. Do NOT romanize.\n"
-    "3. Fix obvious ASR errors using context of the surrounding lines.\n"
+    "3. Fix obvious ASR errors using context of the surrounding lines — e.g. a reply "
+    "heard as 'Amen' or 'I mean' when the speaker is agreeing to a plan is really 'I'm in'.\n"
     "4. Add natural punctuation where it was dropped.\n"
     "5. If a line looks like a hallucination (e.g. 'Thank you for watching', 'Subtitles by Amara.org'), replace with an empty [N] line.\n"
     "6. Do NOT invent content. Only fix what is clearly a recognition error.\n"
@@ -298,16 +379,24 @@ _POLISH_SYS = (
 )
 
 
-def gpt_polish_batch(texts: list[str], language: str | None) -> list[str]:
-    """Clean up ASR errors in a batch of same-language transcripts using GPT-4o-mini."""
+def gpt_polish_batch(
+    texts: list[str], language: str | None, names: list[str] | None = None
+) -> list[str]:
+    """Clean up ASR errors in a batch of same-language transcript lines via GPT."""
     if not texts or not OPENAI_API_KEY:
         return texts
     src_name = _LANG_FULL.get((language or "").lower(), "the original language")
     numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(texts))
+    system = _POLISH_SYS.format(src=src_name)
+    if names:
+        system += (
+            "\n\nKnown participant names (spell exactly like this when a similar-"
+            f"sounding word is clearly a name): {', '.join(names[:30])}"
+        )
     raw = llm_chat(
         "polish",
         [
-            {"role": "system", "content": _POLISH_SYS.format(src=src_name)},
+            {"role": "system", "content": system},
             {"role": "user", "content": numbered},
         ],
         temperature=0.1,
@@ -351,18 +440,24 @@ def gpt_translate_batch(texts: list[str], language: str | None) -> list[str]:
     return [out.get(i + 1, "") for i in range(len(texts))]
 
 
-def detect_language(wav: np.ndarray) -> str | None:
+def detect_language_prob(wav: np.ndarray) -> tuple[str | None, float]:
+    """(language, probability) using the fastest configured model."""
     if wav.size < 1600:
-        return None
+        return None, 0.0
+    fast = WHISPER_MODEL_EN if WHISPER_MODEL_EN and not _is_hf_only(WHISPER_MODEL_EN) else WHISPER_MODEL
+    # Detection runs eagerly inside transcribe(); the segment generator is never consumed.
+    _segments, info = _load_fw(fast).transcribe(
+        wav.astype(np.float32),
+        beam_size=1,
+        best_of=1,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+    )
+    return getattr(info, "language", None), float(getattr(info, "language_probability", 0.0))
+
+
+def detect_language(wav: np.ndarray) -> str | None:
     try:
-        model = _load_fw(WHISPER_MODEL)
-        _segments, info = model.transcribe(
-            wav.astype(np.float32),
-            beam_size=1,
-            best_of=1,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-        )
-        return getattr(info, "language", None)
+        return detect_language_prob(wav)[0]
     except Exception:
         return None

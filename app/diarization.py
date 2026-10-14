@@ -4,7 +4,7 @@ from pathlib import Path
 from pyannote.audio import Pipeline
 import torch
 
-from .config import HF_TOKEN
+from .config import DIARIZATION_STEP, HF_TOKEN
 
 
 @lru_cache(maxsize=1)
@@ -19,6 +19,10 @@ def get_pipeline() -> Pipeline:
     )
     if torch.cuda.is_available():
         pipeline.to(torch.device("cuda"))
+    # Speaker-embedding cost scales with the number of sliding windows; the
+    # default 1 s step embeds every second ~10 times over.
+    seg = pipeline._segmentation
+    seg.step = seg.duration * DIARIZATION_STEP
     return pipeline
 
 

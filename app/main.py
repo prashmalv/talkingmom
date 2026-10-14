@@ -8,9 +8,9 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import numpy as np
@@ -58,6 +58,53 @@ def _save_upload(dest_dir: Path, file: UploadFile) -> Path:
     return raw_path
 
 
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def _audio_response(request: Request, path: Path, media_type: str = "audio/wav"):
+    """Serve a file with HTTP Range support so the browser can seek.
+
+    Starlette 0.38's FileResponse ignores Range headers; without them the
+    browser can't jump to a segment's start time and plays from 0:00.
+    """
+    size = path.stat().st_size
+    m = _RANGE_RE.fullmatch((request.headers.get("range") or "").strip())
+    if not m or (not m.group(1) and not m.group(2)):
+        return FileResponse(path, media_type=media_type, headers={"Accept-Ranges": "bytes"})
+
+    if m.group(1):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+    else:  # suffix range: last N bytes
+        start = max(0, size - int(m.group(2)))
+        end = size - 1
+    end = min(end, size - 1)
+    if start > end or start >= size:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+    def _iter(chunk: int = 64 * 1024):
+        with path.open("rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                data = f.read(min(chunk, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    return StreamingResponse(
+        _iter(),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Length": str(end - start + 1),
+        },
+    )
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -96,11 +143,11 @@ def api_delete_speaker(sid: str):
 
 
 @app.get("/api/speakers/{sid}/audio")
-def api_speaker_audio(sid: str):
+def api_speaker_audio(sid: str, request: Request):
     p = get_speaker_audio_path(sid)
     if not p or not Path(p).exists():
         raise HTTPException(404, "audio not found")
-    return FileResponse(p, media_type="audio/wav")
+    return _audio_response(request, Path(p))
 
 
 # In-memory job tracker for /api/process. Simple; not durable across restarts.
@@ -295,13 +342,13 @@ def api_delete_meeting(mid: str):
 
 
 @app.get("/api/meetings/{audio_id}/audio")
-def api_meeting_audio(audio_id: str):
+def api_meeting_audio(audio_id: str, request: Request):
     # Prevent path traversal — only allow simple filenames from UPLOAD_DIR.
     safe = Path(audio_id).name
     p = UPLOAD_DIR / safe
     if not p.exists():
         raise HTTPException(404, "audio not found")
-    return FileResponse(p, media_type="audio/wav")
+    return _audio_response(request, p)
 
 
 # --- Static frontend ---

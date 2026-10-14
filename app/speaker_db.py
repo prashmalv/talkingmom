@@ -54,14 +54,29 @@ def list_speakers() -> list[dict]:
     return out
 
 
+# Whisper often labels Hindi (and Indian-accented English) as Urdu; the app
+# only supports these three, so anything else is ignored.
+_LANG_ALIASES = {"ur": "hi"}
+_SUPPORTED_LANGS = {"en", "hi", "mr"}
+
+
+def normalize_lang(lang: str | None) -> str | None:
+    lang = (lang or "").lower()
+    lang = _LANG_ALIASES.get(lang, lang)
+    return lang if lang in _SUPPORTED_LANGS else None
+
+
 def get_speaker_language_by_name(name: str) -> str | None:
-    """Return the enrolled language for a speaker matched by resolved name."""
+    """Most common supported language across a person's enrollments."""
     coll = get_collection()
     data = coll.get(include=["metadatas"])
+    counts: dict[str, int] = {}
     for m in data["metadatas"]:
         if m.get("name") == name:
-            return m.get("language") or None
-    return None
+            lang = normalize_lang(m.get("language"))
+            if lang:
+                counts[lang] = counts.get(lang, 0) + 1
+    return max(counts, key=counts.get) if counts else None
 
 
 def get_speaker_audio_path(sid: str) -> Optional[str]:
@@ -74,6 +89,37 @@ def get_speaker_audio_path(sid: str) -> Optional[str]:
 
 def delete_speaker(sid: str) -> None:
     get_collection().delete(ids=[sid])
+
+
+def rank_names(embedding: np.ndarray, k: int = 30) -> list[tuple[str, float]]:
+    """Return [(name, distance), ...] best-first, one entry per enrolled person.
+
+    A person enrolled several times is scored by their closest sample.
+    """
+    coll = get_collection()
+    n = coll.count()
+    if n == 0:
+        return []
+    res = coll.query(
+        query_embeddings=[embedding.tolist()],
+        n_results=min(k, n),
+        include=["metadatas", "distances"],
+    )
+    best: dict[str, float] = {}
+    for m, d in zip(res["metadatas"][0], res["distances"][0]):
+        name = m.get("name", "unknown")
+        if name not in best or d < best[name]:
+            best[name] = float(d)
+    return sorted(best.items(), key=lambda x: x[1])
+
+
+def list_names() -> list[str]:
+    """Distinct enrolled names, for use as Whisper / GPT vocabulary hints."""
+    seen: dict[str, None] = {}
+    for m in get_collection().get(include=["metadatas"])["metadatas"]:
+        if m.get("name"):
+            seen.setdefault(m["name"], None)
+    return list(seen)
 
 
 def match_speaker(

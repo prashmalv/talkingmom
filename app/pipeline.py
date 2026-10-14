@@ -1,13 +1,29 @@
-"""End-to-end pipeline: diarize -> per-segment (embed + STT + speaker match) -> assemble."""
+"""End-to-end pipeline.
+
+    load audio
+      ├─ thread: Whisper over the whole file (word timestamps)
+      └─ pyannote diarization → non-overlapping turns → identify each turn's voice
+    words → turns by timestamp → merge same-speaker turns → polish → translate
+"""
+from bisect import bisect_right
 from pathlib import Path
+import threading
+import time
+
 import numpy as np
 
 from .audio_utils import load_audio, slice_audio
 from .diarization import diarize
-from .transcription import gpt_polish_batch, gpt_translate_batch, transcribe_segment, translate_segment
-from .config import OPENAI_API_KEY, POLISH_TRANSCRIPT
+from .transcription import (
+    detect_language_prob,
+    gpt_polish_batch,
+    gpt_translate_batch,
+    transcribe_segment,
+    transcribe_words,
+)
+from .config import OPENAI_API_KEY, POLISH_TRANSCRIPT, SPEAKER_MATCH_MARGIN, SPEAKER_MATCH_THRESHOLD
 from .embeddings import embed
-from .speaker_db import get_speaker_language_by_name, match_speaker
+from .speaker_db import get_speaker_language_by_name, list_names, normalize_lang, rank_names
 
 
 def _merge_consecutive(segments: list[dict]) -> list[dict]:
@@ -26,6 +42,130 @@ def _merge_consecutive(segments: list[dict]) -> list[dict]:
     return merged
 
 
+_MIN_TURN_S = 0.25
+
+
+def _exclusive_turns(turns: list[dict]) -> list[dict]:
+    """Remove overlaps between diarization turns.
+
+    pyannote emits overlapping turns when people talk over each other. Slicing
+    each turn independently makes Whisper transcribe the shared audio twice,
+    so the same sentence appears under two speakers. Here every instant is
+    given to exactly one speaker: in an overlap, the speaker who started most
+    recently wins. Slivers shorter than _MIN_TURN_S are dropped.
+    """
+    bounds = sorted({t["start"] for t in turns} | {t["end"] for t in turns})
+    out: list[dict] = []
+    for a, b in zip(bounds, bounds[1:]):
+        active = [t for t in turns if t["start"] <= a and t["end"] >= b]
+        if not active:
+            continue
+        owner = max(active, key=lambda t: t["start"])["speaker"]
+        if out and out[-1]["speaker"] == owner and abs(out[-1]["end"] - a) < 1e-6:
+            out[-1]["end"] = b
+        else:
+            out.append({"start": a, "end": b, "speaker": owner})
+    return [t for t in out if t["end"] - t["start"] >= _MIN_TURN_S]
+
+
+# A turn this long carries enough voice to be identified on its own.
+_TURN_ID_MIN_S = 1.5
+# Seconds of processing per second of audio, refined after each meeting;
+# drives the progress bar while transcription runs.
+_rtf = {"value": 1.2}
+
+
+def _pick(ranks: list[tuple[str, float]], need_margin: bool) -> tuple[str | None, float]:
+    """Best enrolled name if it is close enough (and, if asked, clearly ahead of #2)."""
+    if not ranks:
+        return None, float("inf")
+    name, dist = ranks[0]
+    if dist > SPEAKER_MATCH_THRESHOLD:
+        return None, dist
+    if need_margin and len(ranks) > 1 and ranks[1][1] - dist < SPEAKER_MATCH_MARGIN:
+        return None, dist
+    return name, dist
+
+
+def _identify(turns: list[dict], wav: np.ndarray, sr: int) -> list[dict]:
+    """Name every turn (sets t["name"]); returns labels that stayed unknown.
+
+    pyannote labels are only a starting point: it sometimes gives two people
+    the same label, or one person two labels. So a label gets a name from all
+    of its audio, and any turn long enough to judge on its own overrides that
+    when its voice clearly matches someone else.
+    """
+    by_label: dict[str, list[np.ndarray]] = {}
+    for t in turns:
+        by_label.setdefault(t["speaker"], []).append(slice_audio(wav, sr, t["start"], t["end"]))
+    label_name: dict[str, str | None] = {}
+    unresolved: list[dict] = []
+    for label, chunks in by_label.items():
+        merged = np.concatenate(chunks)[: 60 * sr]
+        name, dist = _pick(rank_names(embed(merged)), need_margin=False)
+        label_name[label] = name
+        if name is None:
+            unresolved.append({"label": label, "closest_distance": dist})
+
+    for t in turns:
+        name = label_name[t["speaker"]]
+        if t["end"] - t["start"] >= _TURN_ID_MIN_S:
+            own, dist = _pick(rank_names(embed(slice_audio(wav, sr, t["start"], t["end"]))), need_margin=True)
+            if own and own != name:
+                print(f"[Speakers] {t['start']:.1f}s {t['speaker']}: label={name}, voice={own} ({dist:.2f}) -> {own}", flush=True)
+                name = own
+        t["name"] = name or f"Unknown ({t['speaker']})"
+    return unresolved
+
+
+_SENT_END = (".", "?", "!", "।")
+
+
+def _fix_boundaries(per_turn: list[list[dict]], turns: list[dict]) -> None:
+    """Move a sentence tail that spilled into the next speaker's turn back.
+
+    Diarization boundaries can land a few hundred ms early, so the last word
+    of one person's sentence ("…go on a | picnic? That's a great idea") lands
+    in the next turn. If a turn ends mid-sentence and the next speaker's turn
+    opens with ≤3 words finishing that sentence right at the boundary, those
+    words move back.
+    """
+    for i in range(len(turns) - 1):
+        cur, nxt = per_turn[i], per_turn[i + 1]
+        if not cur or not nxt or turns[i]["name"] == turns[i + 1]["name"]:
+            continue
+        if cur[-1]["word"].strip().endswith(_SENT_END):
+            continue
+        for k, w in enumerate(nxt[:3]):
+            if w["start"] - turns[i]["end"] > 1.0:
+                break
+            if w["word"].strip().endswith(_SENT_END):
+                cur.extend(nxt[: k + 1])
+                del nxt[: k + 1]
+                # Keep per-line playback in sync with the moved words.
+                turns[i]["end"] = max(turns[i]["end"], w["end"])
+                turns[i + 1]["start"] = min(max(turns[i + 1]["start"], w["end"]), turns[i + 1]["end"])
+                break
+
+
+def _assign_words(words: list[dict], turns: list[dict]) -> list[str]:
+    """Give each word to the turn containing its midpoint (else the nearest turn)."""
+    out: list[list[dict]] = [[] for _ in turns]
+    starts = [t["start"] for t in turns]
+
+    def gap(j: int, x: float) -> float:
+        t = turns[j]
+        return 0.0 if t["start"] <= x <= t["end"] else min(abs(x - t["start"]), abs(x - t["end"]))
+
+    for w in words:
+        mid = (w["start"] + w["end"]) / 2
+        i = bisect_right(starts, mid) - 1
+        cands = [j for j in (i, i + 1) if 0 <= j < len(turns)]
+        out[min(cands, key=lambda j: gap(j, mid))].append(w)
+    _fix_boundaries(out, turns)
+    return ["".join(w["word"] for w in ws).strip() for ws in out]
+
+
 def process_meeting(
     audio_path: str | Path,
     language: str | None = None,
@@ -38,62 +178,87 @@ def process_meeting(
                 progress_cb(pct, phase)
             except Exception:
                 pass
+
     _p(5, "loading")
     wav, sr = load_audio(audio_path)
+    duration = len(wav) / sr
+    names = list_names()
+    t0 = time.time()
 
-    _p(10, "diarization")
-    turns = diarize(audio_path)
+    # Whisper and pyannote don't depend on each other — run them concurrently.
+    stt: dict = {}
+
+    def _stt():
+        try:
+            stt["res"] = transcribe_words(wav, language, names)
+        except Exception as e:  # reported below; per-turn fallback takes over
+            stt["err"] = e
+
+    stt_thread = threading.Thread(target=_stt, daemon=True)
+    stt_thread.start()
+
+    # Smooth progress (10% -> 85%) while the heavy models run, estimated from
+    # how fast the previous meeting went.
+    done = threading.Event()
+
+    def _ticker():
+        est = max(8.0, duration * _rtf["value"])
+        while not done.wait(0.5):
+            _p(10 + int(75 * min(0.97, (time.time() - t0) / est)), "transcription")
+
+    threading.Thread(target=_ticker, daemon=True).start()
+
+    try:
+        turns = _exclusive_turns(diarize(audio_path))
+        unresolved = _identify(turns, wav, sr) if turns else []
+        stt_thread.join()
+    finally:
+        done.set()
+    if duration > 5:
+        _rtf["value"] = max(0.3, (time.time() - t0) / duration)
+
     if not turns:
         _p(100, "done")
         return {"segments": [], "transcript": "", "unresolved": []}
-    _p(25, "diarization")
 
-    # One embedding per anonymous pyannote label, aggregated over all its turns.
-    label_wavs: dict[str, list[np.ndarray]] = {}
-    for t in turns:
-        label_wavs.setdefault(t["speaker"], []).append(
-            slice_audio(wav, sr, t["start"], t["end"])
-        )
+    if "err" in stt:
+        print(f"[Pipeline] Whole-file transcription failed ({stt['err']}); using per-turn", flush=True)
+    res = stt.get("res")
+    words, file_lang = res if res else ([], None)
+    texts = _assign_words(words, turns) if res else [""] * len(turns)
 
-    label_to_name: dict[str, str] = {}
-    label_to_lang: dict[str, str | None] = {}
-    unresolved: list[dict] = []
-    for label, chunks in label_wavs.items():
-        merged = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
-        # Cap at 30s of audio to keep the embedding call bounded.
-        if len(merged) > 30 * sr:
-            merged = merged[: 30 * sr]
-        emb = embed(merged)
-        name, dist = match_speaker(emb)
-        resolved = name or f"Unknown ({label})"
-        label_to_name[label] = resolved
-        # Per-speaker language: use enrolled language when the speaker is recognized,
-        # otherwise fall back to the user-selected language (or auto).
-        label_to_lang[label] = get_speaker_language_by_name(name) if name else None
-        if name is None:
-            unresolved.append({"label": label, "closest_distance": dist})
-
-    _p(30, "transcription")
+    _p(86, "transcription")
+    auto = not language or language == "auto"
+    file_lang = normalize_lang(file_lang) or file_lang
     segments = []
-    total = len(turns)
-    for i, t in enumerate(turns):
+    for t, text in zip(turns, texts):
+        spk_lang = None if t["name"].startswith("Unknown") else get_speaker_language_by_name(t["name"])
         chunk = slice_audio(wav, sr, t["start"], t["end"])
-        # Per-speaker language beats the fallback selected in the UI.
-        seg_lang = label_to_lang.get(t["speaker"]) or language
-        text = transcribe_segment(chunk, language=seg_lang)
+        if not res:
+            # No whole-file text: transcribe this turn alone (old behaviour).
+            seg_lang = spk_lang or (None if auto else language)
+            text = transcribe_segment(chunk, language=seg_lang)
+        else:
+            seg_lang = file_lang
+            # Mixed-language meetings (Auto only): a speaker enrolled in another
+            # language is re-transcribed in it — but only if this turn's audio
+            # confirms it, since enrollment language tags can be wrong.
+            if auto and spk_lang and file_lang and spk_lang != file_lang \
+                    and t["end"] - t["start"] >= _TURN_ID_MIN_S:
+                det, prob = detect_language_prob(chunk)
+                if normalize_lang(det) == spk_lang and prob >= 0.6:
+                    seg_lang = spk_lang
+                    text = transcribe_segment(chunk, language=seg_lang)
         if not text:
             continue
-        seg = {
+        segments.append({
             "start": round(t["start"], 2),
             "end": round(t["end"], 2),
-            "speaker": label_to_name[t["speaker"]],
+            "speaker": t["name"],
             "raw_speaker": t["speaker"],
             "text": text,
             "language": seg_lang or "auto",
-        }
-        segments.append(seg)
-        # 30% -> 88% during transcription
-        _p(30 + int(58 * (i + 1) / total), "transcription")
+        })
 
     _p(90, "finalizing")
     segments = _merge_consecutive(segments)
@@ -102,17 +267,17 @@ def process_meeting(
     by_lang_pre: dict[str, list[int]] = {}
     for idx, s in enumerate(segments):
         lang_i = (s.get("language") or "").lower()
-        if lang_i and lang_i != "en":
+        if lang_i and lang_i != "auto":
             by_lang_pre.setdefault(lang_i, []).append(idx)
 
-    # Polish ASR errors in non-English transcripts before translation.
+    # GPT fixes mis-heard words ("amen" -> "I'm in") using the whole conversation.
     if POLISH_TRANSCRIPT and OPENAI_API_KEY and by_lang_pre:
         _p(91, "polishing")
         for lang, indices in by_lang_pre.items():
             texts = [segments[i]["text"] for i in indices]
             try:
-                fixed = gpt_polish_batch(texts, lang)
-                print(f"[Pipeline] Polished {len(indices)} {lang} segments via GPT-4o-mini", flush=True)
+                fixed = gpt_polish_batch(texts, lang, names=names)
+                print(f"[Pipeline] Polished {len(indices)} {lang} segments via GPT", flush=True)
                 for i, t in zip(indices, fixed):
                     if t:
                         segments[i]["text"] = t
@@ -123,13 +288,9 @@ def process_meeting(
     # one API call per language, numbered lines round-trip preserved.
     if translate:
         _p(93, "translation")
-        by_lang: dict[str, list[int]] = {}
-        for idx, s in enumerate(segments):
-            lang = (s.get("language") or "").lower()
-            if lang and lang != "en":
-                by_lang.setdefault(lang, []).append(idx)
-
-        for lang, indices in by_lang.items():
+        for lang, indices in by_lang_pre.items():
+            if lang == "en":
+                continue
             texts = [segments[i]["text"] for i in indices]
             translations: list[str] = []
             if OPENAI_API_KEY:
@@ -142,6 +303,7 @@ def process_meeting(
             for i, tr in zip(indices, translations):
                 if tr:
                     segments[i]["translation"] = tr
+    print(f"[Pipeline] {duration:.0f}s of audio processed in {time.time() - t0:.0f}s", flush=True)
     transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments)
     return {
         "segments": segments,
