@@ -1,11 +1,13 @@
 """FastAPI app: enrollment + meeting processing + summary."""
 import json
+import logging
 import re
 import shutil
 import threading
 import time
 import traceback
 import uuid
+import warnings
 from pathlib import Path
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -25,6 +27,28 @@ from .audio_utils import TARGET_SR
 from .transcription import detect_language
 from .summarizer import summarize
 from .startup_check import run_startup_checks
+from .llm_client import model_label
+from .run_log import MeetingLog
+
+
+class _HideJobPolling(logging.Filter):
+    """The UI polls /api/jobs/{id} every second; those lines bury the
+    processing log, so they're kept out of the console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/jobs/" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_HideJobPolling())
+# Library chatter (model file fetching, raw HTTP calls) — the MeetingLog
+# lines already say which model runs and how long each step takes.
+for _name in ("faster_whisper", "speechbrain", "httpx", "pyannote", "chromadb"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", message=r"std\(\): degrees of freedom")
+warnings.filterwarnings("ignore", message=r"Module 'speechbrain\.pretrained' was deprecated")
+warnings.filterwarnings("ignore", message=r"Requested Pretrainer collection using symlinks")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 app = FastAPI(title="MoM — Meeting Transcription Demo")
 
@@ -125,9 +149,12 @@ async def api_enroll(name: str = Form(...), audio: UploadFile = File(...)):
         wav, _ = load_audio(path)
         if len(wav) < 16000:  # 1 s minimum
             raise HTTPException(400, "Enrollment audio must be at least 1 second long.")
+        log = MeetingLog()
+        log(f"Enroll '{name}': {len(wav) / 16000:.1f}s sample → ECAPA voiceprint + language detection")
         emb = embed(wav)
         lang = detect_language(wav) or ""
         sid = enroll_speaker(name, emb, audio_path=str(path), language=lang)
+        log(f"✓ Enrolled '{name}' (language {lang or 'unknown'}, id {sid})")
     except HTTPException:
         raise
     except Exception as e:
@@ -202,6 +229,8 @@ async def api_process(
     _update_job(jid, progress=8, phase="upload")
 
     def _worker():
+        log = MeetingLog(jid[:8])
+        log.banner(f"Meeting job {jid[:8]} — processing '{audio.filename or path.name}'")
         try:
             def cb(pct: int, phase: str | None = None):
                 upd = {"progress": max(_JOBS[jid]["progress"], min(int(pct), 99))}
@@ -209,13 +238,18 @@ async def api_process(
                     upd["phase"] = phase
                 _update_job(jid, **upd)
 
-            result = process_meeting(path, language=language, translate=translate, progress_cb=cb)
+            result = process_meeting(path, language=language, translate=translate, progress_cb=cb, log=log)
             _update_job(jid, phase="summary", progress=95)
-            summary = summarize(result["transcript"]) if do_summary and result["transcript"] else ""
+            summary = ""
+            if do_summary and result["transcript"]:
+                with log.step(f"Step 7 — Meeting summary ({model_label('summary')})"):
+                    summary = summarize(result["transcript"])
             payload = {**result, "summary": summary, "audio_id": path.name}
             _update_job(jid, status="done", phase="done", progress=100, result=payload)
+            log.banner(f"Job {jid[:8]} finished in {log.elapsed():.0f}s")
         except Exception as e:
             traceback.print_exc()
+            log.banner(f"Job {jid[:8]} FAILED after {log.elapsed():.0f}s: {e}")
             _update_job(jid, status="error", error=str(e))
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -276,6 +310,8 @@ def api_enroll_from_meeting(payload: dict = Body(...)):
         emb = embed(merged)
         lang = detect_language(merged) or ""
         sid = enroll_speaker(name, emb, audio_path=str(clip_path), language=lang)
+        MeetingLog()(f"✓ Enrolled '{name}' from meeting audio ({len(merged) / sr:.1f}s, "
+                     f"language {lang or 'unknown'}, id {sid})")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"Enrollment failed: {e}")

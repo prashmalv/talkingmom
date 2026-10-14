@@ -11,7 +11,11 @@ from .config import CHROMA_DIR, SPEAKER_COLLECTION, SPEAKER_MATCH_THRESHOLD
 
 @lru_cache(maxsize=1)
 def get_client():
-    return chromadb.PersistentClient(path=str(CHROMA_DIR))
+    # Telemetry off: chromadb 0.5.5's posthog call is broken and logs an
+    # ERROR on every query.
+    return chromadb.PersistentClient(
+        path=str(CHROMA_DIR), settings=chromadb.Settings(anonymized_telemetry=False)
+    )
 
 
 def get_collection():

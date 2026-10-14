@@ -49,10 +49,11 @@ print(f"[STT config] Beam size:          {WHISPER_BEAM_SIZE}", flush=True)
 print(f"[STT config] English model:      {WHISPER_MODEL_EN or '(none — uses default)'}", flush=True)
 print(f"[STT config] Marathi override:   {WHISPER_MODEL_MR or '(none — uses default)'}", flush=True)
 print(f"[STT config] Hindi override:     {WHISPER_MODEL_HI or '(none — uses default)'}", flush=True)
-print(f"[STT config] Translation model:  {GPT_TRANSLATE_MODEL if OPENAI_API_KEY else 'Whisper translate task'}", flush=True)
-print(f"[STT config] Polish transcripts: {('yes (' + GPT_POLISH_MODEL + ')') if POLISH_TRANSCRIPT and OPENAI_API_KEY else 'no'}", flush=True)
 try:
-    from .llm_client import active_backend_summary
+    from .llm_client import active_backend_summary, model_label
+    print(f"[STT config] Translation model:  {model_label('translate') if OPENAI_API_KEY else 'none (no API key)'}", flush=True)
+    print(f"[STT config] Polish transcripts: {('yes — ' + model_label('polish')) if POLISH_TRANSCRIPT and OPENAI_API_KEY else 'no'}", flush=True)
+    print(f"[STT config] Summary model:      {model_label('summary') if OPENAI_API_KEY else 'none (no API key)'}", flush=True)
     print(f"[STT config] LLM backend:        {active_backend_summary()}", flush=True)
 except Exception as _e:
     pass
@@ -218,15 +219,18 @@ def _vocab_prompt(names: list[str] | None) -> str:
 
 
 def transcribe_words(
-    wav: np.ndarray, language: str | None = None, names: list[str] | None = None
-) -> tuple[list[dict], str | None] | None:
+    wav: np.ndarray,
+    language: str | None = None,
+    names: list[str] | None = None,
+    log=print,
+) -> dict | None:
     """Transcribe the whole recording in one pass with word timestamps.
 
     One pass is far faster than per-turn calls (every call pads to a 30 s
     window) and gives Whisper the surrounding context, which improves words.
-    Returns (words, detected_language), or None if the configured model for
-    this language can't do word timestamps (HF-only override) — the caller
-    then falls back to per-turn transcription.
+    Returns {"words", "language", "model"}, or None if the configured model
+    for this language can't do word timestamps (HF-only override) — the
+    caller then falls back to per-turn transcription.
     """
     audio = wav.astype(np.float32)
     lang = language if language and language != "auto" else None
@@ -254,17 +258,23 @@ def transcribe_words(
         # English, it does the whole job; otherwise hand off to the right model.
         model_id = WHISPER_MODEL_EN
         segments, info = _start(model_id, None)
+        log(f"Whisper: language detected = {info.language} "
+            f"({info.language_probability:.0%} sure, by '{model_id}')")
         if info.language != "en":
             lang = info.language
             model_id = get_model_id(lang)
             if _is_hf_only(model_id):
                 return None
+            log(f"Whisper: not English → switching to '{model_id}' for {lang}")
             segments, info = _start(model_id, lang)
     else:
         model_id = get_model_id(lang)
         if _is_hf_only(model_id):
             return None
         segments, info = _start(model_id, lang)
+    log(f"Whisper: transcribing whole file with '{model_id}' "
+        f"({WHISPER_DEVICE}/{WHISPER_COMPUTE_TYPE}, {WHISPER_CPU_THREADS} threads, "
+        f"beam {WHISPER_BEAM_SIZE}, language {lang or info.language})")
 
     words: list[dict] = []
     for seg in segments:
@@ -273,8 +283,7 @@ def transcribe_words(
         for w in seg.words or []:
             if w.word.strip():
                 words.append({"start": float(w.start), "end": float(w.end), "word": w.word})
-    print(f"[STT] whole-file: lang={lang or info.language} → faster-whisper [{model_id}], {len(words)} words", flush=True)
-    return words, (lang or getattr(info, "language", None))
+    return {"words": words, "language": lang or getattr(info, "language", None), "model": model_id}
 
 
 def transcribe_segment(wav: np.ndarray, language: str | None = None) -> str:

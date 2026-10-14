@@ -174,6 +174,30 @@ VS Code users can also press **F5** (config in `.vscode/launch.json`).
 
 > **First run is slow:** models (~5 GB) download the first time you enroll a voice / process a meeting. They are cached in `~/.cache/huggingface/` afterwards.
 
+### Reading the terminal while a meeting processes
+
+Each meeting prints a step-by-step log — which model runs, what it found, and how long it took (seconds since the job started on the left). The UI's once-a-second progress polling (`GET /api/jobs/…`) is hidden so it doesn't bury this.
+
+```
+▶ Meeting job c4668586 — processing 'testing1.wav'
+  [   2.8s] Audio: …wav, 49.7s, language=auto, translate=on, polish=on
+  [   2.8s] Step 1 — Speech-to-text (Whisper) started in background
+  [   2.8s] Step 2 — Who spoke when (pyannote/speaker-diarization-3.1, window step 5.0s) …
+  [   7.2s] Whisper: language detected = en (92% sure, by 'small')
+  [   7.2s] Whisper: transcribing whole file with 'small' (cpu/int8, 8 threads, beam 5, language en)
+  [  17.3s]   13 speaking turns, 5 distinct voices: SPEAKER_00, … SPEAKER_04
+  [  17.3s] Step 3 — Identify speakers (SpeechBrain ECAPA voiceprints vs ChromaDB, threshold 0.45) …
+  [  20.3s]   SPEAKER_01 (7s of speech) → Dipanshu (distance 0.30)
+  [  28.1s] ✓ Whisper done in 25.3s — 131 words ('small', en)
+  [  31.1s] Step 4 — Matched 131 words to 13 speaker turns by timestamp
+  [  31.1s] Step 5 — Fix mis-heard words (9 en lines, Azure deployment 'gpt-4.1') …
+  [  34.2s] Transcript ready: 9 lines, 3 speakers (Dipanshu, Gaurav, ojaswi) — 50s of audio in 31s
+  [  34.2s] Step 7 — Meeting summary (Azure deployment 'gpt-4.1') …
+▶ Job c4668586 finished in 38s
+```
+
+Useful for tuning: a speaker shown as `→ Unknown (closest Gaurav 0.48 > 0.45)` tells you how far `SPEAKER_MATCH_THRESHOLD` would need to move.
+
 ---
 
 ## Using the app
@@ -229,6 +253,7 @@ app/
   audio_utils.py     Load / slice / save audio (16 kHz mono)
   config.py          Reads .env, defines paths
   startup_check.py   Preflight health report printed at boot
+  run_log.py         Step-by-step processing log printed to the terminal
 frontend/
   index.html         Entire UI (HTML + CSS + JS in one file)
 data/                Runtime data — auto-created, git-ignored (voices, meetings, DB)

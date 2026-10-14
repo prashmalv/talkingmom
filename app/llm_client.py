@@ -72,6 +72,15 @@ def llm_chat(role: str, messages: list[dict], temperature: float = 0.2) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+def model_label(role: str) -> str:
+    """Human-readable name of the model a role really uses, for logs."""
+    try:
+        m = _model_for(role)
+    except Exception:
+        return "(not configured)"
+    return f"Azure deployment '{m}'" if USE_AZURE_OPENAI else f"OpenAI {m}"
+
+
 def active_backend_summary() -> str:
     """One-line description of which LLM backend is active, for startup logs."""
     if USE_AZURE_OPENAI:

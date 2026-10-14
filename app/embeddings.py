@@ -31,6 +31,9 @@ def _copy_instead_of_symlink(src, dst, local_strategy=None):
 _sb_fetch.link_with_strategy = _copy_instead_of_symlink
 
 from huggingface_hub import snapshot_download  # noqa: E402
+from huggingface_hub.utils import disable_progress_bars  # noqa: E402
+
+disable_progress_bars()  # "Fetching 10 files" bar on every first use
 from speechbrain.inference.speaker import EncoderClassifier  # noqa: E402
 
 from .config import BASE_DIR  # noqa: E402

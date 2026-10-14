@@ -21,8 +21,16 @@ from .transcription import (
     transcribe_segment,
     transcribe_words,
 )
-from .config import OPENAI_API_KEY, POLISH_TRANSCRIPT, SPEAKER_MATCH_MARGIN, SPEAKER_MATCH_THRESHOLD
+from .config import (
+    DIARIZATION_STEP,
+    OPENAI_API_KEY,
+    POLISH_TRANSCRIPT,
+    SPEAKER_MATCH_MARGIN,
+    SPEAKER_MATCH_THRESHOLD,
+)
 from .embeddings import embed
+from .llm_client import model_label
+from .run_log import MeetingLog
 from .speaker_db import get_speaker_language_by_name, list_names, normalize_lang, rank_names
 
 
@@ -87,7 +95,7 @@ def _pick(ranks: list[tuple[str, float]], need_margin: bool) -> tuple[str | None
     return name, dist
 
 
-def _identify(turns: list[dict], wav: np.ndarray, sr: int) -> list[dict]:
+def _identify(turns: list[dict], wav: np.ndarray, sr: int, log=print) -> list[dict]:
     """Name every turn (sets t["name"]); returns labels that stayed unknown.
 
     pyannote labels are only a starting point: it sometimes gives two people
@@ -102,19 +110,30 @@ def _identify(turns: list[dict], wav: np.ndarray, sr: int) -> list[dict]:
     unresolved: list[dict] = []
     for label, chunks in by_label.items():
         merged = np.concatenate(chunks)[: 60 * sr]
-        name, dist = _pick(rank_names(embed(merged)), need_margin=False)
+        ranks = rank_names(embed(merged))
+        name, dist = _pick(ranks, need_margin=False)
         label_name[label] = name
+        secs = sum(len(c) for c in chunks) / sr
         if name is None:
             unresolved.append({"label": label, "closest_distance": dist})
+            closest = f"closest {ranks[0][0]} {ranks[0][1]:.2f}" if ranks else "no one enrolled"
+            log(f"  {label} ({secs:.0f}s of speech) → Unknown ({closest} > {SPEAKER_MATCH_THRESHOLD})")
+        else:
+            log(f"  {label} ({secs:.0f}s of speech) → {name} (distance {dist:.2f})")
 
+    overrides = 0
     for t in turns:
         name = label_name[t["speaker"]]
         if t["end"] - t["start"] >= _TURN_ID_MIN_S:
             own, dist = _pick(rank_names(embed(slice_audio(wav, sr, t["start"], t["end"]))), need_margin=True)
             if own and own != name:
-                print(f"[Speakers] {t['start']:.1f}s {t['speaker']}: label={name}, voice={own} ({dist:.2f}) -> {own}", flush=True)
+                log(f"  turn at {t['start']:.1f}s ({t['speaker']}): voice matches {own} ({dist:.2f}), "
+                    f"not {name or 'Unknown'} → {own}")
                 name = own
+                overrides += 1
         t["name"] = name or f"Unknown ({t['speaker']})"
+    if overrides:
+        log(f"  {overrides} turn(s) re-assigned by their own voice")
     return unresolved
 
 
@@ -171,6 +190,7 @@ def process_meeting(
     language: str | None = None,
     translate: bool = False,
     progress_cb=None,
+    log: MeetingLog | None = None,
 ) -> dict:
     def _p(pct: int, phase: str | None = None):
         if progress_cb:
@@ -179,21 +199,30 @@ def process_meeting(
             except Exception:
                 pass
 
+    log = log or MeetingLog()
     _p(5, "loading")
     wav, sr = load_audio(audio_path)
     duration = len(wav) / sr
     names = list_names()
     t0 = time.time()
+    log(f"Audio: {Path(audio_path).name}, {duration:.1f}s, language={language or 'auto'}, "
+        f"translate={'on' if translate else 'off'}, polish={'on' if POLISH_TRANSCRIPT and OPENAI_API_KEY else 'off'}")
+    log(f"Enrolled voices: {', '.join(names) if names else '(none)'}")
 
     # Whisper and pyannote don't depend on each other — run them concurrently.
     stt: dict = {}
 
     def _stt():
+        t = time.time()
         try:
-            stt["res"] = transcribe_words(wav, language, names)
+            stt["res"] = transcribe_words(wav, language, names, log=log)
+            if stt["res"]:
+                log(f"✓ Whisper done in {time.time() - t:.1f}s — {len(stt['res']['words'])} words "
+                    f"('{stt['res']['model']}', {stt['res']['language']})")
         except Exception as e:  # reported below; per-turn fallback takes over
             stt["err"] = e
 
+    log("Step 1 — Speech-to-text (Whisper) started in background")
     stt_thread = threading.Thread(target=_stt, daemon=True)
     stt_thread.start()
 
@@ -209,8 +238,20 @@ def process_meeting(
     threading.Thread(target=_ticker, daemon=True).start()
 
     try:
-        turns = _exclusive_turns(diarize(audio_path))
-        unresolved = _identify(turns, wav, sr) if turns else []
+        with log.step(f"Step 2 — Who spoke when (pyannote/speaker-diarization-3.1, "
+                      f"window step {10 * DIARIZATION_STEP:.1f}s)"):
+            raw = diarize(audio_path)
+            turns = _exclusive_turns(raw)
+            labels = sorted({t["speaker"] for t in turns})
+            log(f"  {len(turns)} speaking turns, {len(labels)} distinct voices: {', '.join(labels)}")
+        if turns:
+            with log.step(f"Step 3 — Identify speakers (SpeechBrain ECAPA voiceprints vs ChromaDB, "
+                          f"threshold {SPEAKER_MATCH_THRESHOLD})"):
+                unresolved = _identify(turns, wav, sr, log=log)
+        else:
+            unresolved = []
+        if stt_thread.is_alive():
+            log("Waiting for Whisper to finish …")
         stt_thread.join()
     finally:
         done.set()
@@ -218,14 +259,19 @@ def process_meeting(
         _rtf["value"] = max(0.3, (time.time() - t0) / duration)
 
     if not turns:
+        log("No speech found — nothing to transcribe")
         _p(100, "done")
         return {"segments": [], "transcript": "", "unresolved": []}
 
     if "err" in stt:
-        print(f"[Pipeline] Whole-file transcription failed ({stt['err']}); using per-turn", flush=True)
+        log(f"⚠ Whole-file transcription failed ({stt['err']}); transcribing turn by turn instead")
+    elif not stt.get("res"):
+        log("Configured model can't do whole-file mode; transcribing turn by turn instead")
     res = stt.get("res")
-    words, file_lang = res if res else ([], None)
+    words, file_lang = (res["words"], res["language"]) if res else ([], None)
     texts = _assign_words(words, turns) if res else [""] * len(turns)
+    if res:
+        log(f"Step 4 — Matched {len(words)} words to {len(turns)} speaker turns by timestamp")
 
     _p(86, "transcription")
     auto = not language or language == "auto"
@@ -248,6 +294,8 @@ def process_meeting(
                 det, prob = detect_language_prob(chunk)
                 if normalize_lang(det) == spk_lang and prob >= 0.6:
                     seg_lang = spk_lang
+                    log(f"  turn at {t['start']:.1f}s ({t['name']}) is {spk_lang} ({prob:.0%} sure) "
+                        f"→ re-transcribing in {spk_lang}")
                     text = transcribe_segment(chunk, language=seg_lang)
         if not text:
             continue
@@ -276,13 +324,15 @@ def process_meeting(
         for lang, indices in by_lang_pre.items():
             texts = [segments[i]["text"] for i in indices]
             try:
-                fixed = gpt_polish_batch(texts, lang, names=names)
-                print(f"[Pipeline] Polished {len(indices)} {lang} segments via GPT", flush=True)
+                with log.step(f"Step 5 — Fix mis-heard words ({len(indices)} {lang} lines, {model_label('polish')})"):
+                    fixed = gpt_polish_batch(texts, lang, names=names)
+                    changed = sum(1 for a, b in zip(texts, fixed) if b and a != b)
+                    log(f"  {changed} of {len(indices)} lines corrected")
                 for i, t in zip(indices, fixed):
                     if t:
                         segments[i]["text"] = t
-            except Exception as e:
-                print(f"[Pipeline] Polish failed ({e}); using raw ASR text", flush=True)
+            except Exception:
+                log("  using the raw Whisper text instead")
 
     # Batch-translate AFTER merging so GPT sees full context. Group by language,
     # one API call per language, numbered lines round-trip preserved.
@@ -295,15 +345,21 @@ def process_meeting(
             translations: list[str] = []
             if OPENAI_API_KEY:
                 try:
-                    translations = gpt_translate_batch(texts, lang)
-                    print(f"[Pipeline] Batch-translated {len(indices)} {lang} segments via GPT", flush=True)
-                except Exception as e:
-                    print(f"[Pipeline] Batch translation failed ({e}); leaving translation blank", flush=True)
+                    with log.step(f"Step 6 — Translate {len(indices)} {lang} lines → English "
+                                  f"({model_label('translate')})"):
+                        translations = gpt_translate_batch(texts, lang)
+                except Exception:
+                    log("  translation left blank")
                     translations = []
             for i, tr in zip(indices, translations):
                 if tr:
                     segments[i]["translation"] = tr
-    print(f"[Pipeline] {duration:.0f}s of audio processed in {time.time() - t0:.0f}s", flush=True)
+        if not any(l != "en" for l in by_lang_pre):
+            log("Step 6 — Translation skipped (everything is already English)")
+    took = time.time() - t0
+    who = sorted({s["speaker"] for s in segments})
+    log(f"Transcript ready: {len(segments)} lines, {len(who)} speakers ({', '.join(who)}) — "
+        f"{duration:.0f}s of audio in {took:.0f}s ({took / max(duration, 1):.2f}× real time)")
     transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments)
     return {
         "segments": segments,
