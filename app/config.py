@@ -44,6 +44,11 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")           # cpu | cuda
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 (fast, CPU), int8_float16, float16 (GPU)
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+# Hindi/Marathi produce many more tokens per word, and Whisper's retry-on-
+# low-confidence loop re-decodes each 30 s window up to 6×. On CPU that made a
+# 55 s Hindi clip take 12+ min; greedy decoding without retries took ~2 min
+# with the same text quality.
+WHISPER_BEAM_SIZE_INDIC = int(os.getenv("WHISPER_BEAM_SIZE_INDIC", "1"))
 # CPU threads for Whisper; 0 = use all logical cores.
 WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0")) or (os.cpu_count() or 4)
 # Optional per-language model overrides — set to a HF model id to use a fine-tuned model.
@@ -62,9 +67,14 @@ POLISH_TRANSCRIPT = os.getenv("POLISH_TRANSCRIPT", "false").strip().lower() in (
 GPT_POLISH_MODEL = os.getenv("GPT_POLISH_MODEL", "gpt-4o-mini")
 GPT_TRANSLATE_MODEL = os.getenv("GPT_TRANSLATE_MODEL", "gpt-4o")
 SPEAKER_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.45"))
-# A single turn may override its diarization label only if its voice beats
-# the runner-up enrolled person by at least this much (cosine distance).
-SPEAKER_MATCH_MARGIN = float(os.getenv("SPEAKER_MATCH_MARGIN", "0.08"))
+# A voice farther than the threshold but within SPEAKER_MATCH_LOOSE still gets
+# the name if it beats the runner-up enrolled person by SPEAKER_MATCH_MARGIN
+# (different mic / room than at enrollment pushes distances up).
+SPEAKER_MATCH_LOOSE = float(os.getenv("SPEAKER_MATCH_LOOSE", "0.6"))
+SPEAKER_MATCH_MARGIN = float(os.getenv("SPEAKER_MATCH_MARGIN", "0.1"))
+# Turns whose voiceprints are on average more similar than this are grouped
+# as one person. Lower = fewer, bigger groups.
+SPEAKER_CLUSTER_SIMILARITY = float(os.getenv("SPEAKER_CLUSTER_SIMILARITY", "0.3"))
 
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", BASE_DIR / "data" / "chroma"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", BASE_DIR / "data" / "uploads"))

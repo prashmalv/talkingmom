@@ -23,6 +23,7 @@ from .config import (
     OPENAI_API_KEY,
     POLISH_TRANSCRIPT,
     WHISPER_BEAM_SIZE,
+    WHISPER_BEAM_SIZE_INDIC,
     WHISPER_COMPUTE_TYPE,
     WHISPER_CPU_THREADS,
     WHISPER_DEVICE,
@@ -115,21 +116,19 @@ def _load_fw(model_id: str) -> WhisperModel:
 
 def _fw_run(wav: np.ndarray, model_id: str, language: str | None, task: str) -> str:
     model = _load_fw(model_id)
+    opts = _decode_opts(language)
+    opts["condition_on_previous_text"] = False  # single short turn
     segments, _info = model.transcribe(
         wav.astype(np.float32),
         language=language,
         task=task,
-        beam_size=WHISPER_BEAM_SIZE,
         best_of=WHISPER_BEAM_SIZE,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200, threshold=0.5),
         initial_prompt=None,
-        condition_on_previous_text=False,
-        temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
         no_speech_threshold=0.7,
         suppress_blank=True,
+        **opts,
     )
     return " ".join(s.text.strip() for s in segments).strip()
 
@@ -209,13 +208,32 @@ def _run(wav: np.ndarray, language: str | None, task: str) -> str:
     return _clean(text)
 
 
-def _vocab_prompt(names: list[str] | None) -> str:
+_PROMPT_BASE = {
+    "en": ("Participants", "Hello everyone, welcome to the meeting. Okay, let's get started."),
+    "hi": ("प्रतिभागी", "नमस्ते, मीटिंग में आपका स्वागत है। चलिए शुरू करते हैं।"),
+    "mr": ("सहभागी", "नमस्कार, मीटिंगमध्ये आपले स्वागत आहे. चला सुरू करूया."),
+}
+
+
+def _vocab_prompt(names: list[str] | None, lang: str | None = None) -> str:
     # Whisper copies the style of the prompt: a punctuated sentence keeps
     # casing/punctuation on, and listing names makes it spell them correctly.
-    base = "Hello everyone, welcome to the meeting. Okay, let's get started."
+    # The prompt must be in the meeting's script — an English prompt on Hindi
+    # audio makes some models answer in English.
+    label, base = _PROMPT_BASE.get((lang or "en").lower(), _PROMPT_BASE["en"])
     if names:
-        base = f"Participants: {', '.join(names[:30])}. " + base
+        base = f"{label}: {', '.join(names[:30])}. " + base
     return base
+
+
+def _decode_opts(lang: str | None) -> dict:
+    """Decoding settings per language (see WHISPER_BEAM_SIZE_INDIC)."""
+    if lang and lang != "en":
+        return dict(beam_size=WHISPER_BEAM_SIZE_INDIC, temperature=0.0,
+                    condition_on_previous_text=False)
+    return dict(beam_size=WHISPER_BEAM_SIZE, temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                condition_on_previous_text=True, compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0)
 
 
 def transcribe_words(
@@ -241,16 +259,12 @@ def transcribe_words(
             audio,
             language=lang_,
             task="transcribe",
-            beam_size=WHISPER_BEAM_SIZE,
             word_timestamps=True,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
-            initial_prompt=_vocab_prompt(names),
-            condition_on_previous_text=True,
-            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
+            initial_prompt=_vocab_prompt(names, lang_),
             no_speech_threshold=0.6,
+            **_decode_opts(lang_),
         )
 
     if lang is None and WHISPER_MODEL_EN and not _is_hf_only(WHISPER_MODEL_EN):
@@ -272,9 +286,12 @@ def transcribe_words(
         if _is_hf_only(model_id):
             return None
         segments, info = _start(model_id, lang)
+    used = lang or info.language
+    opts = _decode_opts(used)
     log(f"Whisper: transcribing whole file with '{model_id}' "
         f"({WHISPER_DEVICE}/{WHISPER_COMPUTE_TYPE}, {WHISPER_CPU_THREADS} threads, "
-        f"beam {WHISPER_BEAM_SIZE}, language {lang or info.language})")
+        f"beam {opts['beam_size']}, retries {'on' if isinstance(opts['temperature'], list) else 'off'}, "
+        f"language {used})")
 
     words: list[dict] = []
     for seg in segments:

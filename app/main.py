@@ -1,6 +1,7 @@
 """FastAPI app: enrollment + meeting processing + summary."""
 import json
 import logging
+import queue
 import re
 import shutil
 import threading
@@ -209,11 +210,45 @@ def _get_job(jid: str) -> dict | None:
 
 
 def _prune_old_jobs(max_age_s: int = 3600) -> None:
+    """Forget finished jobs after an hour. Queued/running jobs are never pruned."""
     now = time.time()
     with _JOBS_LOCK:
         for jid in list(_JOBS):
-            if now - _JOBS[jid].get("started_at", now) > max_age_s:
+            j = _JOBS[jid]
+            if j["status"] in ("done", "error") and now - j.get("finished_at", now) > max_age_s:
                 _JOBS.pop(jid, None)
+
+
+# One meeting at a time: the models use every CPU core, so parallel jobs just
+# slow each other down (two Hindi jobs together took ~20× real time).
+_QUEUE: "queue.Queue[tuple[str, callable]]" = queue.Queue()
+_PENDING: list[str] = []  # queued job ids, in order
+
+
+def _refresh_queue_positions() -> None:
+    with _JOBS_LOCK:
+        for pos, jid in enumerate(_PENDING):
+            if jid in _JOBS:
+                _JOBS[jid]["detail"] = (
+                    "Next in line — another meeting is processing" if pos == 0
+                    else f"Waiting — {pos + 1} meetings ahead"
+                )
+
+
+def _queue_runner() -> None:
+    while True:
+        jid, fn = _QUEUE.get()
+        with _JOBS_LOCK:
+            if jid in _PENDING:
+                _PENDING.remove(jid)
+        _refresh_queue_positions()
+        try:
+            fn()
+        finally:
+            _QUEUE.task_done()
+
+
+threading.Thread(target=_queue_runner, daemon=True, name="meeting-queue").start()
 
 
 @app.post("/api/process")
@@ -226,14 +261,16 @@ async def api_process(
     _prune_old_jobs()
     path = _save_upload(UPLOAD_DIR, audio)
     jid = _new_job()
-    _update_job(jid, progress=8, phase="upload")
+    _update_job(jid, progress=8, phase="queued")
 
     def _worker():
-        log = MeetingLog(jid[:8])
+        _update_job(jid, phase="loading", started_at=time.time(), detail="Starting")
+        # Every log line is also shown under the progress ring in the UI.
+        log = MeetingLog(jid[:8], on_line=lambda msg: _update_job(jid, detail=msg.strip()))
         log.banner(f"Meeting job {jid[:8]} — processing '{audio.filename or path.name}'")
         try:
             def cb(pct: int, phase: str | None = None):
-                upd = {"progress": max(_JOBS[jid]["progress"], min(int(pct), 99))}
+                upd = {"progress": max(_get_job(jid)["progress"], min(int(pct), 99))}
                 if phase:
                     upd["phase"] = phase
                 _update_job(jid, **upd)
@@ -245,14 +282,21 @@ async def api_process(
                 with log.step(f"Step 7 — Meeting summary ({model_label('summary')})"):
                     summary = summarize(result["transcript"])
             payload = {**result, "summary": summary, "audio_id": path.name}
-            _update_job(jid, status="done", phase="done", progress=100, result=payload)
+            _update_job(jid, status="done", phase="done", progress=100, result=payload,
+                        finished_at=time.time())
             log.banner(f"Job {jid[:8]} finished in {log.elapsed():.0f}s")
         except Exception as e:
             traceback.print_exc()
             log.banner(f"Job {jid[:8]} FAILED after {log.elapsed():.0f}s: {e}")
-            _update_job(jid, status="error", error=str(e))
+            _update_job(jid, status="error", error=str(e), finished_at=time.time())
 
-    threading.Thread(target=_worker, daemon=True).start()
+    with _JOBS_LOCK:
+        _PENDING.append(jid)
+        ahead = _QUEUE.unfinished_tasks
+    _QUEUE.put((jid, _worker))
+    _refresh_queue_positions()
+    if ahead:
+        print(f"[queue] job {jid[:8]} ('{audio.filename}') queued — {ahead} meeting(s) ahead", flush=True)
     return {"job_id": jid}
 
 
@@ -261,6 +305,8 @@ def api_job_status(jid: str):
     j = _get_job(jid)
     if not j:
         raise HTTPException(404, "job not found")
+    end = j.get("finished_at") or time.time()
+    j["elapsed_s"] = 0 if j["phase"] == "queued" else round(end - j["started_at"])
     return j
 
 

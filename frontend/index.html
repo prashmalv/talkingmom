@@ -736,6 +736,12 @@
   @keyframes dots { 0% { width: 0; } 100% { width: 1em; } }
   .progress-info h3.static::after { content: ''; }
   .steps { display: flex; flex-direction: column; gap: 8px; }
+  .progress-detail {
+    margin-top: 14px; font: 11.5px/1.5 'JetBrains Mono', ui-monospace, monospace;
+    color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .progress-detail:empty { display: none; }
+  .progress-detail .el { color: var(--accent-2); margin-right: 8px; }
   .step {
     display: flex; align-items: center; gap: 10px;
     font-size: 14px; color: var(--mut);
@@ -1033,6 +1039,7 @@
             Finalizing
           </div>
         </div>
+        <div class="progress-detail" id="progressDetail"></div>
       </div>
     </div>
 
@@ -1484,6 +1491,7 @@ function playSegment(audioId, start, end, btn) {
 // --- Progress UI ---
 const PHASE_ORDER = ['upload', 'diarization', 'transcription', 'summary', 'finalizing', 'done'];
 const PHASE_STEP = {
+  queued: 'upload',
   upload: 'upload',
   loading: 'upload',
   diarization: 'transcription',
@@ -1495,6 +1503,7 @@ const PHASE_STEP = {
   done: 'finalizing',
 };
 const PHASE_TITLE = {
+  queued: 'Waiting in queue',
   upload: 'Uploading',
   loading: 'Loading audio',
   diarization: 'Detecting speakers',
@@ -1559,6 +1568,7 @@ function setProgress(pct, phase) {
 function showProgress() {
   $('progressCard').style.display = 'flex';
   setProgress(0, 'upload');
+  setDetail(null);
   $('progressCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -1566,20 +1576,43 @@ function hideProgress() {
   $('progressCard').style.display = 'none';
 }
 
+function setDetail(j) {
+  const el = $('progressDetail');
+  if (!j || (!j.detail && !j.elapsed_s)) { el.innerHTML = ''; return; }
+  const s = j.elapsed_s || 0;
+  const el_t = s ? `<span class="el">${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}</span>` : '';
+  el.innerHTML = el_t + escapeHtml(j.detail || '');
+  el.title = j.detail || '';
+}
+
+// The running job id survives a page refresh, so reloading resumes the
+// progress view instead of tempting a second upload of the same meeting.
+const ACTIVE_JOB_KEY = 'mom-active-job';
+function rememberJob(jid) { try { jid ? localStorage.setItem(ACTIVE_JOB_KEY, jid) : localStorage.removeItem(ACTIVE_JOB_KEY); } catch (e) {} }
+
 async function pollJob(jid) {
+  let failures = 0;
   while (true) {
     let j;
     try {
       const r = await fetch('/api/jobs/' + encodeURIComponent(jid));
+      if (r.status === 404) {
+        rememberJob(null);
+        throw new Error('This job no longer exists — the server was probably restarted. Please process the meeting again.');
+      }
       if (!r.ok) throw new Error('status ' + r.status);
       j = await r.json();
+      failures = 0;
     } catch (e) {
+      if (e.message.startsWith('This job')) throw e;
+      if (++failures >= 40) throw new Error('Lost contact with the server');
       await new Promise(res => setTimeout(res, 1500));
       continue;
     }
     setProgress(j.progress || 0, j.phase);
-    if (j.status === 'done') return j.result;
-    if (j.status === 'error') throw new Error(j.error || 'Processing failed');
+    setDetail(j);
+    if (j.status === 'done') { rememberJob(null); return j.result; }
+    if (j.status === 'error') { rememberJob(null); throw new Error(j.error || 'Processing failed'); }
     await new Promise(res => setTimeout(res, 900));
   }
 }
@@ -1611,14 +1644,30 @@ async function processBlob(blob, filename) {
   fd.append('language', $('langSelect').value);
   fd.append('translate', $('doTranslate').checked);
   showProgress();
+  let startResp;
   try {
     // Phase 1 — upload (0-8%)
-    const startResp = await uploadWithProgress(fd, (frac) => {
+    startResp = await uploadWithProgress(fd, (frac) => {
       setProgress(Math.round(frac * 8), 'upload');
     });
-    const jid = startResp.job_id;
-    if (!jid) throw new Error('No job id returned');
-    // Phase 2 — server-side pipeline
+    if (!startResp.job_id) throw new Error('No job id returned');
+  } catch (e) {
+    hideProgress();
+    setStatus('processStatus', 'Failed: ' + e.message, 'err');
+    toast('Upload failed', 'err');
+    btn.disabled = false;
+    throw e;
+  }
+  rememberJob(startResp.job_id);
+  return followJob(startResp.job_id);
+}
+
+// Phase 2 — server-side pipeline: poll until done, then show the transcript.
+async function followJob(jid) {
+  const btn = $('processBtn'); btn.disabled = true;
+  setStatus('processStatus', 'Processing…', 'loading');
+  $('progressCard').style.display = 'flex';
+  try {
     const result = await pollJob(jid);
     setProgress(100, 'done');
     setTimeout(hideProgress, 700);
@@ -1949,6 +1998,16 @@ $('themeToggle').onclick = () => {
 
 refreshSpeakers();
 refreshMeetings();
+
+// Resume a meeting that was still processing when the page was reloaded.
+(function resumeActiveJob() {
+  let jid = null;
+  try { jid = localStorage.getItem(ACTIVE_JOB_KEY); } catch (e) {}
+  if (!jid) return;
+  setProgress(0, 'transcription');
+  followJob(jid).catch(() => {});
+  toast('Resumed the meeting that was still processing', 'ok');
+})();
 </script>
 </body>
 </html>

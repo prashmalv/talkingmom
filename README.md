@@ -25,10 +25,10 @@ Each participant enrolls their voice once; after that the app recognises who sai
 Meeting audio → normalise to 16 kHz mono WAV (librosa / ffmpeg)
   ├─ in parallel ─ faster-whisper, ONE pass over the whole file, word timestamps
   │                (English → `small`, Hindi/Marathi → `large-v3`; names given as vocabulary)
-  └─ pyannote 3.1 diarization → who spoke when (SPEAKER_00, SPEAKER_01 …)
+  └─ pyannote 3.1 diarization → speaking turns (when someone starts/stops)
        → overlaps removed (each moment belongs to one speaker)
-       → SpeechBrain ECAPA voice fingerprint per label AND per turn
-       → ChromaDB cosine match → enrolled name (or "Unknown")
+       → SpeechBrain ECAPA voiceprint per turn → turns GROUPED by voice
+       → each group's pooled voice vs ChromaDB → enrolled name (or "Unknown")
   → each word goes to the speaker turn it was spoken in
   → GPT polish      (optional)  fix mis-heard words, all languages
   → GPT translate   (optional)  Hindi/Marathi → natural English
@@ -39,7 +39,8 @@ Diarization, speaker embeddings and Whisper run **locally**. Only the polish / t
 
 **Why it's built this way**
 - **One Whisper pass, not one per turn.** Whisper pads every call to a 30 s window, so transcribing 2 s turns one at a time costs ~15× more. A single pass also gives Whisper the conversation's context, which improves word accuracy.
-- **Every turn is identified by its own voice.** pyannote sometimes gives two people the same label (or one person two labels). A turn of 1.5 s or longer whose voice clearly matches a different enrolled person overrides its label.
+- **Speakers are grouped by our own voiceprints, not pyannote's labels.** pyannote finds turn boundaries well, but its grouping fails on short back-and-forth conversations (it put two people under one label, or one person under several). Each turn ≥ 1 s gets an ECAPA voiceprint; turns are clustered (average linkage, `SPEAKER_CLUSTER_SIMILARITY`), and short replies join the most similar group.
+- **Each group is named from all its audio together.** Pooled audio matches far more reliably than single turns. A group gets a name if it's within `SPEAKER_MATCH_THRESHOLD`, or within `SPEAKER_MATCH_LOOSE` *and* clearly closer (`SPEAKER_MATCH_MARGIN`) than the next enrolled person — that covers a different mic/room than at enrollment. One person can't be given to two groups in the same meeting.
 - **Mixed-language meetings (Auto).** If a speaker's enrolled language differs from the meeting's, their turns are checked with language detection and re-transcribed in their language only when the audio confirms it.
 
 ---
@@ -186,8 +187,10 @@ Each meeting prints a step-by-step log — which model runs, what it found, and 
   [   7.2s] Whisper: language detected = en (92% sure, by 'small')
   [   7.2s] Whisper: transcribing whole file with 'small' (cpu/int8, 8 threads, beam 5, language en)
   [  17.3s]   13 speaking turns, 5 distinct voices: SPEAKER_00, … SPEAKER_04
-  [  17.3s] Step 3 — Identify speakers (SpeechBrain ECAPA voiceprints vs ChromaDB, threshold 0.45) …
-  [  20.3s]   SPEAKER_01 (7s of speech) → Dipanshu (distance 0.30)
+  [  17.3s] Step 3 — Group turns by voice & identify (SpeechBrain ECAPA vs ChromaDB, …) …
+  [  30.1s]   voiceprints grouped 13 turns into 3 voices (pyannote had 5)
+  [  41.6s]   SPEAKER_00 (13s of speech) → Dipanshu (distance 0.27)
+  [  41.6s]   SPEAKER_01 (9s of speech) → Aakash (distance 0.56, weaker match but 0.28 ahead of next person)
   [  28.1s] ✓ Whisper done in 25.3s — 131 words ('small', en)
   [  31.1s] Step 4 — Matched 131 words to 13 speaker turns by timestamp
   [  31.1s] Step 5 — Fix mis-heard words (9 en lines, Azure deployment 'gpt-4.1') …
@@ -196,7 +199,11 @@ Each meeting prints a step-by-step log — which model runs, what it found, and 
 ▶ Job c4668586 finished in 38s
 ```
 
-Useful for tuning: a speaker shown as `→ Unknown (closest Gaurav 0.48 > 0.45)` tells you how far `SPEAKER_MATCH_THRESHOLD` would need to move.
+Useful for tuning: a speaker shown as `→ Unknown (closest Gaurav 0.48)` tells you how far `SPEAKER_MATCH_THRESHOLD` would need to move.
+
+Lines are tagged with the job id (`[c4668586  12.3s]`). The latest line is also shown under the progress ring in the browser, with the elapsed time.
+
+**One meeting at a time.** The models use every CPU core, so meetings are processed one after another: a second upload shows *Waiting in queue — N ahead* instead of slowing both down. **Refreshing the page resumes** the meeting that was processing — no need to upload it again.
 
 ---
 
@@ -227,13 +234,16 @@ Useful for tuning: a speaker shown as `→ Unknown (closest Gaurav 0.48 > 0.45)`
 | `WHISPER_MODEL_EN` | empty (`.env.example`: `small`) | Model for English; in Auto mode it also detects the language. Blank = use `WHISPER_MODEL` |
 | `WHISPER_DEVICE` | `cpu` | `cpu` or `cuda` |
 | `WHISPER_COMPUTE_TYPE` | `int8` | `int8` for CPU, `float16` for GPU |
-| `WHISPER_BEAM_SIZE` | `5` | Higher = more accurate, slower |
+| `WHISPER_BEAM_SIZE` | `5` | English beam size. Higher = more accurate, slower |
+| `WHISPER_BEAM_SIZE_INDIC` | `1` | Hindi/Marathi beam size; retries are also off for these. On CPU a 55 s Hindi clip took 12+ min with beam 5 + retries, ~3 min like this, same text quality |
 | `WHISPER_CPU_THREADS` | `0` | CPU threads for Whisper; `0` = all cores |
 | `WHISPER_MODEL_MR` / `WHISPER_MODEL_HI` | empty | Optional HuggingFace model id for Marathi / Hindi |
 | `POLISH_TRANSCRIPT` | `false` | `true` = GPT fixes mis-heard words in every language, using context and enrolled names |
 | `DIARIZATION_STEP` | `0.5` | pyannote window step (fraction of 10 s). `0.1` = pyannote default, ~5× slower on CPU |
-| `SPEAKER_MATCH_THRESHOLD` | `0.45` | Cosine distance; lower = stricter matching |
-| `SPEAKER_MATCH_MARGIN` | `0.08` | How clearly a single turn's voice must beat the runner-up to override its diarization label |
+| `SPEAKER_MATCH_THRESHOLD` | `0.45` | Cosine distance for a confident match; lower = stricter |
+| `SPEAKER_MATCH_LOOSE` | `0.6` | Farther matches up to this distance are accepted only if clearly ahead of the runner-up |
+| `SPEAKER_MATCH_MARGIN` | `0.1` | How far ahead of the next enrolled person a loose match must be |
+| `SPEAKER_CLUSTER_SIMILARITY` | `0.3` | Voiceprint similarity for grouping turns as one person. Raise if two people get merged, lower if one person gets split |
 | `CHROMA_DIR`, `UPLOAD_DIR`, `ENROLL_DIR`, `MEETINGS_DIR` | `./data/...` | Storage folders (auto-created) |
 
 ---
@@ -297,9 +307,11 @@ Interactive docs: http://localhost:8000/docs
 | Preflight `LLM API reachable` fails with 401 | Key doesn't belong to that endpoint / resource |
 | Preflight fails with 404 `DeploymentNotFound` | `AZURE_OPENAI_DEPLOYMENT_*` doesn't match a deployment name in Azure |
 | First meeting is very slow | Models are downloading (~5 GB) — one-time |
-| Processing is slow on CPU | Plug in the laptop (battery mode throttles the CPU). Check `WHISPER_MODEL_EN=small` and `DIARIZATION_STEP=0.5`. For Hindi/Marathi try `WHISPER_MODEL=medium`, or use a GPU (`WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`) |
+| Processing is slow on CPU | Hindi/Marathi use `large-v3` and take ~3–4× the audio length on CPU (English ~0.7×). For faster Hindi set `WHISPER_MODEL=deepdml/faster-whisper-large-v3-turbo-ct2` (~2× faster, a few more word errors that GPT polish mostly fixes). Plug in the laptop (battery mode throttles the CPU). Check `WHISPER_MODEL_EN=small` and `DIARIZATION_STEP=0.5`. For Hindi/Marathi try `WHISPER_MODEL=medium`, or use a GPU (`WHISPER_DEVICE=cuda`, `WHISPER_COMPUTE_TYPE=float16`) |
 | A person shows as "Unknown" | Raise `SPEAKER_MATCH_THRESHOLD` (e.g. `0.5`) or re-enroll with a longer sample recorded on the same mic you use for meetings |
 | Names get mixed up | Lower `SPEAKER_MATCH_THRESHOLD` (e.g. `0.35`) or raise `SPEAKER_MATCH_MARGIN` |
+| Two people's lines under one speaker | Raise `SPEAKER_CLUSTER_SIMILARITY` (e.g. `0.4`). The terminal log shows "grouped N turns into M voices" |
+| One person split into two speakers | Lower `SPEAKER_CLUSTER_SIMILARITY` (e.g. `0.2`) |
 | Lines show a wrong language / script (e.g. Urdu) | Choose the meeting language explicitly instead of Auto, or re-enroll that person speaking their usual language |
 | Mis-heard words | Set `POLISH_TRANSCRIPT=true`; enroll participants (their names are used as vocabulary); improve audio quality |
 | "Failed to fetch" during processing | Don't run Uvicorn with `--reload` (file writes restart the server) |
@@ -313,7 +325,8 @@ This is an internal demo, **not production-hardened**:
 
 - No authentication — anyone who can reach the server has full access (it binds to `0.0.0.0`)
 - Single shared speaker database (no multi-user isolation)
-- Jobs are kept in memory — lost if the server restarts
+- Jobs are kept in memory — lost if the server restarts (the page then says so instead of waiting forever)
+- Meetings are processed one at a time; with several users, later uploads wait in the queue
 - Uploaded audio is never cleaned up automatically
 - PDF export uses a Latin font, so Devanagari text doesn't render correctly in the PDF
 - Very long meetings may exceed LLM context limits for polish / translate / summary

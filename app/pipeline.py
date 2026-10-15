@@ -25,6 +25,8 @@ from .config import (
     DIARIZATION_STEP,
     OPENAI_API_KEY,
     POLISH_TRANSCRIPT,
+    SPEAKER_CLUSTER_SIMILARITY,
+    SPEAKER_MATCH_LOOSE,
     SPEAKER_MATCH_MARGIN,
     SPEAKER_MATCH_THRESHOLD,
 )
@@ -76,64 +78,119 @@ def _exclusive_turns(turns: list[dict]) -> list[dict]:
     return [t for t in out if t["end"] - t["start"] >= _MIN_TURN_S]
 
 
-# A turn this long carries enough voice to be identified on its own.
+# A turn this long carries enough voice to check its language on its own.
 _TURN_ID_MIN_S = 1.5
+# Turns at least this long have a voiceprint reliable enough to drive grouping;
+# shorter ones ("Yes.", "Perfect.") are attached to a group afterwards.
+_CLUSTER_MIN_S = 1.0
 # Seconds of processing per second of audio, refined after each meeting;
 # drives the progress bar while transcription runs.
 _rtf = {"value": 1.2}
 
 
-def _pick(ranks: list[tuple[str, float]], need_margin: bool) -> tuple[str | None, float]:
-    """Best enrolled name if it is close enough (and, if asked, clearly ahead of #2)."""
-    if not ranks:
-        return None, float("inf")
-    name, dist = ranks[0]
-    if dist > SPEAKER_MATCH_THRESHOLD:
-        return None, dist
-    if need_margin and len(ranks) > 1 and ranks[1][1] - dist < SPEAKER_MATCH_MARGIN:
-        return None, dist
-    return name, dist
+def _group_by_voice(turns: list[dict], wav: np.ndarray, sr: int, log=print) -> None:
+    """Re-group turns into speakers by their ECAPA voiceprints (rewrites t["speaker"]).
+
+    pyannote's own grouping is unreliable on short, alternating conversations:
+    it can put two people under one label (or one person under two). Its turn
+    *boundaries* are good, so we keep those and redo the grouping: average-
+    linkage clustering of per-turn voiceprints, stopping when groups are less
+    than SPEAKER_CLUSTER_SIMILARITY alike.
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+
+    embs = {i: embed(slice_audio(wav, sr, t["start"], t["end"]))
+            for i, t in enumerate(turns) if t["end"] - t["start"] >= 0.3}
+    long_ids = [i for i in embs if turns[i]["end"] - turns[i]["start"] >= _CLUSTER_MIN_S]
+    if len(long_ids) < 2:
+        log("  too little speech to re-group by voice; keeping pyannote's groups")
+        return
+
+    E = np.stack([embs[i] for i in long_ids])
+    ids = fcluster(linkage(E, method="average", metric="cosine"),
+                   t=1 - SPEAKER_CLUSTER_SIMILARITY, criterion="distance")
+    assign = {i: int(g) for i, g in zip(long_ids, ids)}
+    centroids = {}
+    for g in set(assign.values()):
+        c = np.mean([embs[i] for i, gg in assign.items() if gg == g], axis=0)
+        centroids[g] = c / (np.linalg.norm(c) or 1.0)
+
+    # pyannote label -> group most of its long turns landed in (fallback vote).
+    votes: dict[str, dict[int, int]] = {}
+    for i, g in assign.items():
+        v = votes.setdefault(turns[i]["speaker"], {})
+        v[g] = v.get(g, 0) + 1
+
+    for i, t in enumerate(turns):
+        if i in assign:
+            continue
+        g = None
+        if i in embs:
+            sims = {gg: float(embs[i] @ c) for gg, c in centroids.items()}
+            best = max(sims, key=sims.get)
+            if sims[best] >= 0.25:
+                g = best
+        if g is None and t["speaker"] in votes:
+            g = max(votes[t["speaker"]], key=votes[t["speaker"]].get)
+        if g is None:  # nearest grouped turn in time
+            g = assign[min(long_ids, key=lambda j: abs(turns[j]["start"] - t["start"]))]
+        assign[i] = g
+
+    before = len({t["speaker"] for t in turns})
+    new_label: dict[int, str] = {}
+    for i, t in enumerate(turns):
+        t["speaker"] = new_label.setdefault(assign[i], f"SPEAKER_{len(new_label):02d}")
+    log(f"  voiceprints grouped {len(turns)} turns into {len(new_label)} voices (pyannote had {before})")
 
 
 def _identify(turns: list[dict], wav: np.ndarray, sr: int, log=print) -> list[dict]:
-    """Name every turn (sets t["name"]); returns labels that stayed unknown.
+    """Group turns by voice, then name each group (sets t["name"]).
 
-    pyannote labels are only a starting point: it sometimes gives two people
-    the same label, or one person two labels. So a label gets a name from all
-    of its audio, and any turn long enough to judge on its own overrides that
-    when its voice clearly matches someone else.
+    Each group's pooled audio (up to 60 s) is compared with every enrolled
+    person — far more reliable than judging single turns. A group gets a name
+    if it's within SPEAKER_MATCH_THRESHOLD, or within SPEAKER_MATCH_LOOSE and
+    clearly ahead (SPEAKER_MATCH_MARGIN) of the next-closest person. Each
+    person can be given to only one group per meeting.
+    Returns the groups that stayed unknown.
     """
+    _group_by_voice(turns, wav, sr, log)
+
     by_label: dict[str, list[np.ndarray]] = {}
     for t in turns:
         by_label.setdefault(t["speaker"], []).append(slice_audio(wav, sr, t["start"], t["end"]))
-    label_name: dict[str, str | None] = {}
+    ranks_of = {label: rank_names(embed(np.concatenate(chunks)[: 60 * sr]))
+                for label, chunks in by_label.items()}
+
+    # Best matches first, one person per group and one group per person.
+    candidates = []
+    for label, ranks in ranks_of.items():
+        for name, dist in ranks:
+            others = [d for n, d in ranks if n != name]
+            margin = (min(others) if others else 1.0) - dist
+            if dist <= SPEAKER_MATCH_THRESHOLD or (dist <= SPEAKER_MATCH_LOOSE and margin >= SPEAKER_MATCH_MARGIN):
+                candidates.append((dist, label, name, margin))
+    label_name: dict[str, tuple[str, float, float]] = {}
+    used: set[str] = set()
+    for dist, label, name, margin in sorted(candidates):
+        if label not in label_name and name not in used:
+            label_name[label] = (name, dist, margin)
+            used.add(name)
+
     unresolved: list[dict] = []
     for label, chunks in by_label.items():
-        merged = np.concatenate(chunks)[: 60 * sr]
-        ranks = rank_names(embed(merged))
-        name, dist = _pick(ranks, need_margin=False)
-        label_name[label] = name
         secs = sum(len(c) for c in chunks) / sr
-        if name is None:
-            unresolved.append({"label": label, "closest_distance": dist})
-            closest = f"closest {ranks[0][0]} {ranks[0][1]:.2f}" if ranks else "no one enrolled"
-            log(f"  {label} ({secs:.0f}s of speech) → Unknown ({closest} > {SPEAKER_MATCH_THRESHOLD})")
+        ranks = ranks_of[label]
+        if label in label_name:
+            name, dist, margin = label_name[label]
+            how = "" if dist <= SPEAKER_MATCH_THRESHOLD else f", weaker match but {margin:.2f} ahead of next person"
+            log(f"  {label} ({secs:.0f}s of speech) → {name} (distance {dist:.2f}{how})")
         else:
-            log(f"  {label} ({secs:.0f}s of speech) → {name} (distance {dist:.2f})")
+            closest = f"closest {ranks[0][0]} {ranks[0][1]:.2f}" if ranks else "no one enrolled"
+            unresolved.append({"label": label, "closest_distance": ranks[0][1] if ranks else None})
+            log(f"  {label} ({secs:.0f}s of speech) → Unknown ({closest})")
 
-    overrides = 0
     for t in turns:
-        name = label_name[t["speaker"]]
-        if t["end"] - t["start"] >= _TURN_ID_MIN_S:
-            own, dist = _pick(rank_names(embed(slice_audio(wav, sr, t["start"], t["end"]))), need_margin=True)
-            if own and own != name:
-                log(f"  turn at {t['start']:.1f}s ({t['speaker']}): voice matches {own} ({dist:.2f}), "
-                    f"not {name or 'Unknown'} → {own}")
-                name = own
-                overrides += 1
-        t["name"] = name or f"Unknown ({t['speaker']})"
-    if overrides:
-        log(f"  {overrides} turn(s) re-assigned by their own voice")
+        t["name"] = label_name[t["speaker"]][0] if t["speaker"] in label_name else f"Unknown ({t['speaker']})"
     return unresolved
 
 
@@ -245,8 +302,8 @@ def process_meeting(
             labels = sorted({t["speaker"] for t in turns})
             log(f"  {len(turns)} speaking turns, {len(labels)} distinct voices: {', '.join(labels)}")
         if turns:
-            with log.step(f"Step 3 — Identify speakers (SpeechBrain ECAPA voiceprints vs ChromaDB, "
-                          f"threshold {SPEAKER_MATCH_THRESHOLD})"):
+            with log.step(f"Step 3 — Group turns by voice & identify (SpeechBrain ECAPA vs ChromaDB, "
+                          f"match ≤{SPEAKER_MATCH_THRESHOLD}, or ≤{SPEAKER_MATCH_LOOSE} if clearly ahead)"):
                 unresolved = _identify(turns, wav, sr, log=log)
         else:
             unresolved = []

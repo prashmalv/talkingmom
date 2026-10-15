@@ -10,16 +10,23 @@ _PRINT_LOCK = threading.Lock()  # Whisper and diarization log from two threads
 
 
 class MeetingLog:
-    def __init__(self, job: str = ""):
+    def __init__(self, job: str = "", on_line=None):
         self.t0 = time.time()
         self.job = job
+        self.on_line = on_line  # e.g. mirror each line into the UI's job status
 
     def elapsed(self) -> float:
         return time.time() - self.t0
 
     def __call__(self, msg: str) -> None:
+        tag = f"{self.job} " if self.job else ""
         with _PRINT_LOCK:
-            print(f"  [{self.elapsed():6.1f}s] {msg}", flush=True)
+            print(f"  [{tag}{self.elapsed():6.1f}s] {msg}", flush=True)
+        if self.on_line:
+            try:
+                self.on_line(msg)
+            except Exception:
+                pass
 
     def banner(self, msg: str) -> None:
         with _PRINT_LOCK:
