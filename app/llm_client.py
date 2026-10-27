@@ -61,15 +61,27 @@ def _model_for(role: str) -> str:
     return openai_model
 
 
-def llm_chat(role: str, messages: list[dict], temperature: float = 0.2) -> str:
-    """Send a chat completion using the correct model for the given role."""
+def llm_chat(role: str, messages: list[dict], temperature: float = 0.2, **kwargs) -> str:
+    """Send a chat completion using the correct model for the given role.
+
+    Extra kwargs (e.g. response_format={"type": "json_object"}) are passed through.
+    """
     client = _client()
     resp = client.chat.completions.create(
         model=_model_for(role),
         messages=messages,
         temperature=temperature,
+        **kwargs,
     )
     return (resp.choices[0].message.content or "").strip()
+
+
+def llm_json(role: str, messages: list[dict], temperature: float = 0.1) -> dict:
+    """Chat completion that must return a JSON object."""
+    import json
+
+    raw = llm_chat(role, messages, temperature=temperature, response_format={"type": "json_object"})
+    return json.loads(raw)
 
 
 def model_label(role: str) -> str:

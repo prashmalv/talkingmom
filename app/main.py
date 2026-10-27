@@ -1,7 +1,6 @@
 """FastAPI app: enrollment + meeting processing + summary."""
 import json
 import logging
-import queue
 import re
 import shutil
 import threading
@@ -30,14 +29,21 @@ from .summarizer import summarize
 from .startup_check import run_startup_checks
 from .llm_client import model_label
 from .run_log import MeetingLog
+from .jobs import enqueue, get_job, job_status, new_job, prune_old_jobs, update_job
+from .phase2.routes import router as phase2_router
 
 
 class _HideJobPolling(logging.Filter):
-    """The UI polls /api/jobs/{id} every second; those lines bury the
-    processing log, so they're kept out of the console."""
+    """The UIs poll job status, room status and the room screen every second;
+    those lines bury the processing log, so they're kept out of the console."""
+
+    _NOISY = ("/api/jobs/", "/api/p2/screen", "/api/p2/time", "/audio?pid=")
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return "/api/jobs/" not in record.getMessage()
+        msg = record.getMessage()
+        if any(n in msg for n in self._NOISY):
+            return False
+        return not ('"GET /api/p2/rooms/' in msg and "/result" not in msg)
 
 
 logging.getLogger("uvicorn.access").addFilter(_HideJobPolling())
@@ -178,79 +184,6 @@ def api_speaker_audio(sid: str, request: Request):
     return _audio_response(request, Path(p))
 
 
-# In-memory job tracker for /api/process. Simple; not durable across restarts.
-_JOBS: dict[str, dict] = {}
-_JOBS_LOCK = threading.Lock()
-
-
-def _new_job() -> str:
-    jid = uuid.uuid4().hex
-    with _JOBS_LOCK:
-        _JOBS[jid] = {
-            "status": "running",
-            "progress": 0,
-            "phase": "upload",
-            "started_at": time.time(),
-            "result": None,
-            "error": None,
-        }
-    return jid
-
-
-def _update_job(jid: str, **updates) -> None:
-    with _JOBS_LOCK:
-        if jid in _JOBS:
-            _JOBS[jid].update(updates)
-
-
-def _get_job(jid: str) -> dict | None:
-    with _JOBS_LOCK:
-        j = _JOBS.get(jid)
-        return dict(j) if j else None
-
-
-def _prune_old_jobs(max_age_s: int = 3600) -> None:
-    """Forget finished jobs after an hour. Queued/running jobs are never pruned."""
-    now = time.time()
-    with _JOBS_LOCK:
-        for jid in list(_JOBS):
-            j = _JOBS[jid]
-            if j["status"] in ("done", "error") and now - j.get("finished_at", now) > max_age_s:
-                _JOBS.pop(jid, None)
-
-
-# One meeting at a time: the models use every CPU core, so parallel jobs just
-# slow each other down (two Hindi jobs together took ~20× real time).
-_QUEUE: "queue.Queue[tuple[str, callable]]" = queue.Queue()
-_PENDING: list[str] = []  # queued job ids, in order
-
-
-def _refresh_queue_positions() -> None:
-    with _JOBS_LOCK:
-        for pos, jid in enumerate(_PENDING):
-            if jid in _JOBS:
-                _JOBS[jid]["detail"] = (
-                    "Next in line — another meeting is processing" if pos == 0
-                    else f"Waiting — {pos + 1} meetings ahead"
-                )
-
-
-def _queue_runner() -> None:
-    while True:
-        jid, fn = _QUEUE.get()
-        with _JOBS_LOCK:
-            if jid in _PENDING:
-                _PENDING.remove(jid)
-        _refresh_queue_positions()
-        try:
-            fn()
-        finally:
-            _QUEUE.task_done()
-
-
-threading.Thread(target=_queue_runner, daemon=True, name="meeting-queue").start()
-
-
 @app.post("/api/process")
 async def api_process(
     audio: UploadFile = File(...),
@@ -258,55 +191,47 @@ async def api_process(
     language: str = Form("auto"),
     translate: bool = Form(False),
 ):
-    _prune_old_jobs()
+    prune_old_jobs()
     path = _save_upload(UPLOAD_DIR, audio)
-    jid = _new_job()
-    _update_job(jid, progress=8, phase="queued")
+    jid = new_job()
+    update_job(jid, progress=8)
 
     def _worker():
-        _update_job(jid, phase="loading", started_at=time.time(), detail="Starting")
+        update_job(jid, phase="loading", started_at=time.time(), detail="Starting")
         # Every log line is also shown under the progress ring in the UI.
-        log = MeetingLog(jid[:8], on_line=lambda msg: _update_job(jid, detail=msg.strip()))
+        log = MeetingLog(jid[:8], on_line=lambda msg: update_job(jid, detail=msg.strip()))
         log.banner(f"Meeting job {jid[:8]} — processing '{audio.filename or path.name}'")
         try:
             def cb(pct: int, phase: str | None = None):
-                upd = {"progress": max(_get_job(jid)["progress"], min(int(pct), 99))}
+                upd = {"progress": max(get_job(jid)["progress"], min(int(pct), 99))}
                 if phase:
                     upd["phase"] = phase
-                _update_job(jid, **upd)
+                update_job(jid, **upd)
 
             result = process_meeting(path, language=language, translate=translate, progress_cb=cb, log=log)
-            _update_job(jid, phase="summary", progress=95)
+            update_job(jid, phase="summary", progress=95)
             summary = ""
             if do_summary and result["transcript"]:
                 with log.step(f"Step 7 — Meeting summary ({model_label('summary')})"):
                     summary = summarize(result["transcript"])
             payload = {**result, "summary": summary, "audio_id": path.name}
-            _update_job(jid, status="done", phase="done", progress=100, result=payload,
+            update_job(jid, status="done", phase="done", progress=100, result=payload,
                         finished_at=time.time())
             log.banner(f"Job {jid[:8]} finished in {log.elapsed():.0f}s")
         except Exception as e:
             traceback.print_exc()
             log.banner(f"Job {jid[:8]} FAILED after {log.elapsed():.0f}s: {e}")
-            _update_job(jid, status="error", error=str(e), finished_at=time.time())
+            update_job(jid, status="error", error=str(e), finished_at=time.time())
 
-    with _JOBS_LOCK:
-        _PENDING.append(jid)
-        ahead = _QUEUE.unfinished_tasks
-    _QUEUE.put((jid, _worker))
-    _refresh_queue_positions()
-    if ahead:
-        print(f"[queue] job {jid[:8]} ('{audio.filename}') queued — {ahead} meeting(s) ahead", flush=True)
+    enqueue(jid, _worker, f"'{audio.filename}'")
     return {"job_id": jid}
 
 
 @app.get("/api/jobs/{jid}")
 def api_job_status(jid: str):
-    j = _get_job(jid)
+    j = job_status(jid)
     if not j:
         raise HTTPException(404, "job not found")
-    end = j.get("finished_at") or time.time()
-    j["elapsed_s"] = 0 if j["phase"] == "queued" else round(end - j["started_at"])
     return j
 
 
@@ -441,3 +366,19 @@ if FRONTEND_DIR.exists():
     @app.get("/")
     def index():
         return FileResponse(FRONTEND_DIR / "index.html")
+
+    # Phase 2 POC — AI meeting room (separate screens; the page above is unchanged).
+    @app.get("/phase2")
+    def phase2_page():
+        return FileResponse(FRONTEND_DIR / "phase2.html")
+
+    @app.get("/join")
+    def join_page():
+        return FileResponse(FRONTEND_DIR / "join.html")
+
+    @app.get("/present")
+    def present_page():
+        return FileResponse(FRONTEND_DIR / "present.html")
+
+
+app.include_router(phase2_router)

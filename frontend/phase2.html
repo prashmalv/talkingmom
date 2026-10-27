@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AI Meeting Room</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/p2.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  .tabs { display: flex; gap: 6px; padding: 14px 24px 0; max-width: 1400px; margin: 0 auto; flex-wrap: wrap; }
+  .tabs button { background: transparent; color: var(--fg-dim); border: 1px solid transparent; }
+  .tabs button.on { background: var(--surface); color: var(--fg); border-color: var(--border-hi); }
+  main { max-width: 1400px; margin: 0 auto; padding: 16px 24px 60px; }
+  .panel[hidden] { display: none !important; }
+  .meet { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 18px; align-items: start; }
+  @media (max-width: 1000px) { .meet { grid-template-columns: 1fr; } }
+  .stack > * + * { margin-top: 14px; }
+  .code { font: 800 34px/1 'JetBrains Mono', monospace; letter-spacing: .18em; }
+  .joinbox { display: grid; grid-template-columns: auto 1fr; gap: 16px; align-items: center; }
+  #qr { background: #fff; padding: 8px; border-radius: 10px; width: 156px; height: 156px; }
+  .link { font: 12px 'JetBrains Mono', monospace; word-break: break-all; color: var(--accent-2); }
+  .people { display: flex; flex-direction: column; gap: 6px; }
+  .person { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: var(--radius-sm);
+    background: var(--hover-bg); border: 1px solid var(--border); font-size: 13px; }
+  .av { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 11px;
+    background: var(--grad); color: #fff; flex-shrink: 0; }
+  .timer { font: 700 26px 'JetBrains Mono', monospace; }
+  .progress { height: 8px; border-radius: 999px; background: var(--hover-bg); overflow: hidden; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--grad); transition: width .4s; }
+  .detail { font: 12px 'JetBrains Mono', monospace; color: var(--fg-dim); margin-top: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .line { display: flex; gap: 10px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--hover-bg);
+    border: 1px solid var(--border); margin-bottom: 6px; }
+  .line .who { font-weight: 600; font-size: 13px; } .line .t { font: 10.5px 'JetBrains Mono', monospace; color: var(--mut); margin-left: 6px; }
+  .line .txt { font-size: 13.5px; line-height: 1.55; margin-top: 2px; overflow-wrap: anywhere; }
+  .line .tr { font-size: 12.5px; color: var(--fg-dim); font-style: italic; margin-top: 4px; }
+  .play { width: 28px; height: 28px; padding: 0; border-radius: 50%; background: transparent; border: 1px solid var(--border-hi); color: var(--fg-dim); flex-shrink: 0; }
+  /* assistant */
+  .chat { display: flex; flex-direction: column; gap: 12px; max-height: 62vh; overflow-y: auto; padding-right: 4px; }
+  .msg-q { align-self: flex-end; max-width: 85%; background: var(--grad-soft); border: 1px solid var(--border-hi);
+    padding: 9px 13px; border-radius: 14px 14px 4px 14px; font-size: 13.5px; }
+  .msg-q .heard { font-size: 10.5px; color: var(--mut); display: block; margin-bottom: 2px; }
+  .msg-a { background: var(--hover-bg); border: 1px solid var(--border); border-radius: 14px; padding: 13px; }
+  .msg-a .ans { font-size: 14px; line-height: 1.55; margin-bottom: 10px; }
+  .msg-a .meta { font-size: 11px; color: var(--mut); display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--hover-bg); color: var(--fg-dim); border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 11px; font-size: 12px; font-weight: 500; }
+  .chip:hover { color: var(--fg); border-color: var(--accent-2); }
+  .askbar { display: flex; gap: 8px; align-items: center; }
+  .mic { width: 44px; height: 44px; padding: 0; border-radius: 50%; background: var(--err); flex-shrink: 0; }
+  .mic.on { background: #fff; color: var(--err); animation: blink 1.2s infinite; }
+  .toggle { display: inline-flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--fg-dim); cursor: pointer; }
+  .toggle input { width: auto; }
+  .thinking { font-size: 13px; color: var(--accent-2); }
+  /* dashboard */
+  .dash { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+  @media (max-width: 520px) { .dash { grid-template-columns: 1fr; } }
+  .card-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+  /* minutes */
+  .mins { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 18px; align-items: start; }
+  @media (max-width: 1000px) { .mins { grid-template-columns: 1fr; } }
+  .mlist { display: flex; flex-direction: column; gap: 6px; }
+  .mitem { padding: 11px 12px; border-radius: var(--radius-sm); background: var(--hover-bg); border: 1px solid var(--border); cursor: pointer; }
+  .mitem:hover, .mitem.on { border-color: var(--accent); }
+  .mitem .t { font-weight: 600; font-size: 13.5px; } .mitem .s { font-size: 11.5px; color: var(--mut); margin-top: 3px; }
+  .ed-sec { margin-top: 18px; } .ed-sec h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--fg-dim); }
+  table.ai { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.ai th { text-align: left; font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: .05em; padding: 6px; }
+  table.ai td { padding: 4px; vertical-align: top; } table.ai input, table.ai select { padding: 7px 9px; font-size: 13px; }
+  .disc { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; margin-bottom: 8px; }
+  .disc .row { flex-wrap: nowrap; } .disc .row input { flex: 1; width: auto; }
+  .locked input, .locked textarea, .locked select:not(.st) { pointer-events: none; opacity: .75; }
+  .conv { margin-top: 8px; max-height: 420px; overflow-y: auto; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 8px 10px; background: var(--input-bg); }
+  .cline { display: grid; grid-template-columns: 44px max-content 1fr; gap: 8px; padding: 5px 0;
+    border-bottom: 1px solid var(--border); font-size: 13px; line-height: 1.5; }
+  .cline:last-child { border-bottom: 0; }
+  .cline .ct { font: 10.5px 'JetBrains Mono', monospace; color: var(--mut); padding-top: 3px; }
+  .cline .cw { font-weight: 600; white-space: nowrap; }
+  .cline .ctr { display: block; color: var(--fg-dim); font-style: italic; font-size: 12px; }
+  @media (max-width: 560px) { .cline { grid-template-columns: 1fr; gap: 0; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 18h18M5 18V9l7-5 7 5v9"/><path d="M9 18v-5h6v5"/></svg></div>
+    <div><h1>AI-Enabled Meeting Room</h1><p>Phase 2 POC · Water Supply &amp; Sanitation</p></div>
+  </div>
+  <div class="row">
+    <nav class="switch"><a href="/">MoM</a><a href="/phase2" class="on">Phase 2 · AI Meeting Room</a></nav>
+    <span class="badge sample" title="Scheme figures are synthetic, for demonstration">● Sample data</span>
+    <a class="btn-ghost btn-sm" href="/present" target="mom-screen" style="text-decoration:none;border-radius:10px;padding:7px 12px;font-weight:600;font-size:12px">Room screen ↗</a>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="on" data-tab="meet">Meeting room</button>
+  <button data-tab="dash">Dashboard</button>
+  <button data-tab="mins">Minutes &amp; actions</button>
+</nav>
+
+<main>
+<!-- ============================== MEETING ROOM ============================== -->
+<section class="panel" id="p-meet">
+  <div class="meet">
+    <div class="stack">
+      <div class="card" id="createCard">
+        <h2>Start a meeting</h2>
+        <div class="switch" id="srcSwitch" style="margin:4px 0 12px">
+          <a href="#" data-src="devices" class="on">Participants' devices</a>
+          <a href="#" data-src="meet">Google Meet bot</a>
+        </div>
+        <p class="sub" id="srcHelp">Participants join from their own phone or laptop under their name — no voice samples needed.</p>
+        <div id="meetBox" hidden style="margin-bottom:12px">
+          <label class="lbl" for="mMeet">Google Meet link</label>
+          <input id="mMeet" class="mono" placeholder="https://meet.google.com/abc-defg-hij">
+          <div class="row small" style="margin-top:8px;gap:8px">
+            <button class="btn-ghost btn-sm" id="botSignin">Sign in bot's Google account</button>
+            <span class="muted grow" id="botSigninState">One time: Google only admits signed-in bots.</span>
+          </div>
+        </div>
+        <label class="lbl" for="mTitle">Meeting title</label>
+        <input id="mTitle" placeholder="e.g. Monthly JJM review — Nagpur division" style="margin-bottom:12px">
+        <div class="row" style="margin-bottom:14px">
+          <div class="grow"><label class="lbl" for="mLang">Language</label>
+            <select id="mLang"><option value="auto">Auto (mixed)</option><option value="en">English</option><option value="hi">Hindi</option><option value="mr">Marathi</option></select></div>
+          <label class="toggle" style="margin-top:18px"><input type="checkbox" id="mTranslate" checked> English translation</label>
+        </div>
+        <button class="btn-primary" id="createBtn" style="width:100%">Create meeting room</button>
+      </div>
+
+      <div class="card" id="roomCard" hidden>
+        <div class="row"><div class="grow"><h2 id="rTitle"></h2><p class="sub" id="rState" style="margin:0"></p></div>
+          <span class="timer" id="rTimer">0:00</span></div>
+        <div id="botBox" hidden style="margin-top:16px">
+          <div class="person" style="align-items:flex-start">
+            <div class="av">🤖</div>
+            <div class="grow"><div style="font-weight:600">MoM Assistant <span class="small muted">in Google Meet</span></div>
+              <div class="small" id="botDetail" style="margin-top:2px"></div>
+              <div class="link" id="botUrl" style="margin-top:4px"></div></div>
+          </div>
+          <h4 style="margin:16px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-dim)">Live captions from Meet <span class="small muted" style="text-transform:none;letter-spacing:0">(final text comes from our Whisper)</span></h4>
+          <div id="botCaps"><div class="empty">Captions appear here once the bot is admitted and people speak.</div></div>
+        </div>
+        <div class="joinbox" id="joinBox" style="margin-top:16px">
+          <div id="qr"></div>
+          <div>
+            <div class="small muted">Meeting code</div>
+            <div class="code" id="rCode"></div>
+            <div class="small muted" style="margin-top:10px">Join link — open on each participant's device</div>
+            <div class="link" id="rLink"></div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn-ghost btn-sm" id="copyBtn">Copy link</button>
+              <a class="btn-ghost btn-sm" id="selfJoin" target="_blank" style="text-decoration:none;border-radius:10px;padding:6px 10px;font-size:12px;font-weight:600">Join from this device ↗</a>
+            </div>
+            <div class="small" id="httpsWarn" style="color:var(--warn);margin-top:8px" hidden>
+              Other devices need an <b>https://</b> link for the microphone — run <span class="mono">python run.py --https</span>.</div>
+          </div>
+        </div>
+        <h4 style="margin:18px 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-dim)"><span id="pLabel">Participants</span> <span id="pCount"></span></h4>
+        <div class="people" id="people"><div class="empty">Waiting for people to join…</div></div>
+        <div class="row" style="margin-top:16px">
+          <button class="btn-primary grow" id="startBtn">Start meeting</button>
+          <button class="btn-danger grow" id="endBtn" hidden>End meeting &amp; prepare minutes</button>
+        </div>
+      </div>
+
+      <div class="card" id="procCard" hidden>
+        <h2>Preparing transcript &amp; minutes</h2>
+        <p class="sub" id="procPhase">Waiting for final uploads…</p>
+        <div class="progress"><i id="procBar"></i></div>
+        <div class="detail" id="procDetail"></div>
+      </div>
+
+      <div class="card" id="resultCard" hidden>
+        <div class="row"><div class="grow"><h2>Transcript</h2><p class="sub" style="margin:0">Names come from each participant's own device</p></div>
+          <button class="btn-primary btn-sm" id="openMomBtn">Open minutes</button>
+          <button class="btn-ghost btn-sm" id="newMeetBtn">New meeting</button></div>
+        <div id="transcript" style="margin-top:14px"></div>
+      </div>
+    </div>
+
+    <!-- assistant -->
+    <div class="card">
+      <div class="row"><div class="grow"><h2>Ask the data</h2>
+        <p class="sub" style="margin:0">Voice or text · English, हिंदी, मराठी · answers only from governed queries</p></div>
+        <select id="aLang" style="width:auto"><option value="auto">Auto</option><option value="en">EN</option><option value="hi">HI</option><option value="mr">MR</option></select></div>
+      <div class="chips" id="chips" style="margin:14px 0"></div>
+      <div class="chat" id="chat"></div>
+      <div class="askbar" style="margin-top:14px">
+        <button class="mic" id="micBtn" title="Click to speak, click again to send">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4"/></svg></button>
+        <input id="aInput" placeholder="e.g. Compare Nashik and Nagpur on tap connections" class="grow">
+        <button class="btn-primary" id="aSend">Ask</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label class="toggle"><input type="checkbox" id="autoScreen" checked> Show answers on the room screen</label>
+        <span class="grow"></span>
+        <button class="btn-ghost btn-sm" id="resetScreen">Reset room screen</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== DASHBOARD ============================== -->
+<section class="panel" id="p-dash" hidden>
+  <div class="row" style="margin-bottom:14px">
+    <div style="width:280px"><label class="lbl" for="dDistrict">District</label>
+      <select id="dDistrict"><option value="">Maharashtra — state overview</option></select></div>
+    <span class="grow"></span>
+    <span class="small muted">Every card can be sent to the room screen</span>
+  </div>
+  <div class="dash" id="dash"></div>
+</section>
+
+<!-- ============================== MINUTES ============================== -->
+<section class="panel" id="p-mins" hidden>
+  <div class="mins">
+    <div class="card">
+      <h2>Minutes of meetings</h2>
+      <p class="sub">Drafts are reviewed and approved before circulation</p>
+      <div class="mlist" id="mlist"></div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+        <label class="lbl" for="fromMeeting">Draft formal minutes from a saved MoM meeting</label>
+        <div class="row"><select id="fromMeeting" class="grow"></select><button class="btn-ghost btn-sm" id="fromBtn">Draft</button></div>
+      </div>
+    </div>
+    <div class="card" id="editor"><div class="empty">Select minutes on the left, or finish a meeting.</div></div>
+  </div>
+</section>
+</main>
+
+<script src="/static/p2.js"></script>
+<script>
+// ---------------------------------------------------------------- tabs
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+function showTab(t) {
+  document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('on', x.dataset.tab === t));
+  for (const p of ['meet', 'dash', 'mins']) $('p-' + p).hidden = p !== t;
+  if (t === 'dash' && !$('dash').childElementCount) loadDashboard();
+  if (t === 'mins') loadMoms();
+}
+
+// ---------------------------------------------------------------- meeting room
+let room = null, roomPoll = null;
+const ROOM_KEY = 'mom-p2-room';
+
+let src = 'devices';
+document.querySelectorAll('#srcSwitch a').forEach(a => a.onclick = (e) => {
+  e.preventDefault(); src = a.dataset.src;
+  document.querySelectorAll('#srcSwitch a').forEach(x => x.classList.toggle('on', x === a));
+  $('meetBox').hidden = src !== 'meet';
+  $('srcHelp').textContent = src === 'meet'
+    ? 'Paste a Google Meet link. “MoM Assistant” joins the call — admit it in Meet. Speaker names come from Meet accounts.'
+    : 'Participants join from their own phone or laptop under their name — no voice samples needed.';
+  $('createBtn').textContent = src === 'meet' ? 'Send bot to the meeting' : 'Create meeting room';
+});
+
+async function refreshSignin() {
+  try {
+    const s = await api('/api/p2/meet/signin');
+    $('botSigninState').textContent = s.signed_in_once
+      ? `Sign-in window last opened ${s.since}. Close that Chrome window before sending the bot.`
+      : 'One time: Google only admits signed-in bots. Use a Google account made for the bot (e.g. “MoM Assistant”).';
+  } catch (e) {}
+}
+refreshSignin();
+$('botSignin').onclick = async () => {
+  try {
+    await api('/api/p2/meet/signin', { method: 'POST' });
+    toast('Chrome opened — sign in to the bot\'s Google account there, then close that window', 'ok');
+    refreshSignin();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+$('createBtn').onclick = async () => {
+  try {
+    const body = { title: $('mTitle').value, language: $('mLang').value, translate: $('mTranslate').checked };
+    if (src === 'meet') {
+      body.meet_url = $('mMeet').value.trim();
+      if (!body.meet_url) { toast('Paste the Google Meet link', 'err'); return; }
+    }
+    room = await api('/api/p2/rooms', { json: body });
+    try { localStorage.setItem(ROOM_KEY, room.code); } catch (e) {}
+    showRoom();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+// Join links must work on other devices: if this page was opened as
+// localhost, swap in the PC's network address (localhost on a phone = the phone).
+let lanIp = '';
+const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+function joinUrl(code) {
+  const host = LOCAL_HOSTS.includes(location.hostname) && lanIp
+    ? `${lanIp}${location.port ? ':' + location.port : ''}` : location.host;
+  return `${location.protocol}//${host}/join?room=${code}`;
+}
+const lanReady = api('/api/p2/net').then(n => { lanIp = n.lan_ip || ''; }).catch(() => {});
+
+async function showRoom() {
+  await lanReady;
+  $('createCard').hidden = true; $('roomCard').hidden = false;
+  const meet = room.source === 'meet';
+  $('botBox').hidden = !meet; $('joinBox').hidden = meet;
+  $('pLabel').textContent = meet ? 'Speakers seen in Meet' : 'Participants';
+  if (meet) $('botUrl').textContent = room.meet_url;
+  $('rTitle').textContent = room.title; $('rCode').textContent = room.code;
+  const url = joinUrl(room.code);
+  $('rLink').textContent = url; $('selfJoin').href = url;
+  $('httpsWarn').hidden = location.protocol === 'https:';
+  $('qr').innerHTML = '';
+  if (window.QRCode) new QRCode($('qr'), { text: url, width: 140, height: 140 });
+  clearInterval(roomPoll); roomPoll = setInterval(refreshRoom, 1500); refreshRoom();
+}
+
+function renderPeople(r) {
+  $('pCount').textContent = `(${r.participants.length})`;
+  if (!r.participants.length) { $('people').innerHTML = `<div class="empty">Waiting for people to join… scan the QR code or open the link on each device.</div>`; return; }
+  $('people').innerHTML = r.participants.map(p => `
+    <div class="person"><div class="av">${esc(p.name.split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase())}</div>
+      <div class="grow">${esc(p.name)}</div>
+      <span class="small muted">${p.uploaded_s ? fmtClock(p.uploaded_s) + ' sent' : ''}</span>
+      <span class="badge"><span class="dot ${p.recording ? 'rec' : ''}" style="${p.online ? '' : 'background:var(--mut);box-shadow:none'}"></span>
+        ${p.final ? 'Done' : p.recording ? 'Recording' : p.online ? 'Ready' : 'Offline'}</span></div>`).join('');
+}
+
+function renderBot(r) {
+  const b = r.bot;
+  $('botDetail').textContent = b.detail + (b.recorded_s ? ` · ${fmtClock(b.recorded_s)} recorded` : '');
+  $('botDetail').style.color = b.state === 'error' ? 'var(--err)' : b.state === 'recording' ? 'var(--ok)' : 'var(--fg-dim)';
+  $('pCount').textContent = `(${b.people.length})`;
+  $('people').innerHTML = b.people.length ? b.people.map(n => `
+    <div class="person"><div class="av">${esc(n.split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase())}</div>
+      <div class="grow">${esc(n)}</div><span class="small muted">from Meet account</span></div>`).join('')
+    : `<div class="empty">${b.state === 'recording' && !b.captions_on ? 'Waiting for captions — if none appear, turn on captions (CC) in the bot window.' : 'Speakers appear as they talk.'}</div>`;
+  $('botCaps').innerHTML = b.captions.length ? b.captions.map(c => `
+    <div class="line"><div class="grow"><span class="who">${esc(c.name)}</span><div class="txt">${esc(c.text)}</div></div></div>`).join('')
+    : '<div class="empty">Captions appear here once the bot is admitted and people speak.</div>';
+}
+
+async function refreshRoom() {
+  if (!room) return;
+  let r;
+  try { r = await api(`/api/p2/rooms/${room.code}`); } catch (e) {
+    clearInterval(roomPoll); toast(e.message, 'err'); resetRoom(); return;
+  }
+  room = r;
+  if (r.bot) renderBot(r); else renderPeople(r);
+  $('rTimer').textContent = fmtClock(r.elapsed_s);
+  const st = { lobby: 'Not started — participants can join now', live: 'Live — recording every participant',
+    ending: 'Ending — collecting final audio', processing: 'Processing', done: 'Finished', error: 'Failed: ' + (r.error || '') }[r.state];
+  $('rState').textContent = st;
+  $('startBtn').hidden = r.state !== 'lobby' || !!r.bot;  // the bot starts by itself once admitted
+  $('endBtn').hidden = !(r.state === 'live' || (r.bot && r.state === 'lobby'));
+  $('endBtn').textContent = r.bot ? (r.state === 'live' ? 'Stop bot & prepare minutes' : 'Cancel bot')
+                                  : 'End meeting & prepare minutes';
+  if (['ending', 'processing'].includes(r.state)) showProcessing(r);
+  if (r.state === 'done') { clearInterval(roomPoll); showResult(); }
+  if (r.state === 'error') { clearInterval(roomPoll); $('procCard').hidden = false; $('procPhase').textContent = 'Failed: ' + r.error; }
+}
+
+$('startBtn').onclick = async () => {
+  if (!room.participants.length && !confirm('Nobody has joined yet. Start anyway?')) return;
+  room = await api(`/api/p2/rooms/${room.code}/start`, { method: 'POST' }); refreshRoom();
+};
+$('endBtn').onclick = async () => {
+  if (!confirm('End the meeting and prepare the minutes?')) return;
+  room = await api(`/api/p2/rooms/${room.code}/end`, { method: 'POST' }); refreshRoom();
+};
+$('copyBtn').onclick = () => { navigator.clipboard?.writeText(joinUrl(room.code)); toast('Join link copied'); };
+
+async function showProcessing(r) {
+  $('procCard').hidden = false;
+  if (!r.job_id) { $('procPhase').textContent = 'Waiting for every device to upload its last audio…'; return; }
+  try {
+    const j = await api('/api/jobs/' + r.job_id);
+    $('procBar').style.width = (j.progress || 0) + '%';
+    $('procPhase').textContent = j.phase === 'queued' ? 'Waiting in queue' : `${fmtClock(j.elapsed_s)} elapsed`;
+    $('procDetail').textContent = j.detail || '';
+  } catch (e) {}
+}
+
+async function showResult() {
+  $('procCard').hidden = true;
+  const res = await api(`/api/p2/rooms/${room.code}/result`);
+  $('resultCard').hidden = false;
+  $('transcript').innerHTML = res.segments.length ? '' : '<div class="empty">No speech was captured.</div>';
+  for (const s of res.segments) {
+    const d = document.createElement('div'); d.className = 'line';
+    d.innerHTML = `<button class="play" title="Play">▶</button><div class="grow">
+      <div><span class="who">${esc(s.speaker)}</span><span class="t">${fmtClock(s.start)}</span></div>
+      <div class="txt">${esc(s.text)}</div>${s.translation ? `<div class="tr">EN: ${esc(s.translation)}</div>` : ''}</div>`;
+    d.querySelector('.play').onclick = () => playSeg(res.audio_id, s.start, s.end);
+    $('transcript').appendChild(d);
+  }
+  $('openMomBtn').hidden = !res.mom_id;
+  $('openMomBtn').onclick = () => { showTab('mins'); openMom(res.mom_id); };
+}
+
+let player = null;
+function playSeg(audioId, start, end) {
+  if (player) { player.pause(); player = null; }
+  const a = new Audio('/api/meetings/' + encodeURIComponent(audioId) + '/audio');
+  player = a;
+  a.onloadedmetadata = () => { a.onseeked = () => { a.onseeked = null; a.play(); }; a.currentTime = start; };
+  a.ontimeupdate = () => { if (a.currentTime >= end) a.pause(); };
+}
+
+function resetRoom() {
+  room = null; clearInterval(roomPoll);
+  try { localStorage.removeItem(ROOM_KEY); } catch (e) {}
+  for (const id of ['roomCard', 'procCard', 'resultCard']) $(id).hidden = true;
+  $('createCard').hidden = false;
+}
+$('newMeetBtn').onclick = resetRoom;
+
+(async function resumeRoom() {
+  let code = null; try { code = localStorage.getItem(ROOM_KEY); } catch (e) {}
+  if (!code) return;
+  try { room = await api('/api/p2/rooms/' + code); showRoom(); } catch (e) { resetRoom(); }
+})();
+
+// ---------------------------------------------------------------- assistant
+const EXAMPLES = ['Show the status of Pune district', 'Compare Nashik and Nagpur on tap connection coverage',
+  'Which 5 districts are lagging in ODF Plus?', 'Any anomalies this month?', 'Water quality trend in Beed',
+  'पुणे जिले की स्थिति दिखाओ', 'नागपूर आणि वर्धा जिल्ह्यांची पाणी गुणवत्ता तुलना करा'];
+$('chips').innerHTML = EXAMPLES.map(q => `<button class="chip">${esc(q)}</button>`).join('');
+$('chips').querySelectorAll('.chip').forEach(c => c.onclick = () => askText(c.textContent));
+$('chat').innerHTML = `<div class="empty">Ask about scheme status, comparisons, rankings, trends or anomalies.<br>
+  During a live meeting, questions are recorded in the minutes under "Data reviewed".</div>`;
+
+function liveRoom() { return room && room.state === 'live' ? room.code : ''; }
+
+function addQ(text, heard) {
+  if ($('chat').querySelector('.empty')) $('chat').innerHTML = '';
+  const q = document.createElement('div'); q.className = 'msg-q';
+  q.innerHTML = (heard ? '<span class="heard">🎙 heard</span>' : '') + esc(text);
+  $('chat').appendChild(q);
+  const a = document.createElement('div'); a.className = 'msg-a';
+  a.innerHTML = '<div class="thinking">Thinking…</div>';
+  $('chat').appendChild(a); $('chat').scrollTop = $('chat').scrollHeight;
+  return { q, a };
+}
+
+function showAnswer(box, res) {
+  box.innerHTML = `<div class="ans">${esc(res.answer)}</div>`;
+  if (res.ok && res.view) {
+    const v = document.createElement('div'); box.appendChild(v); renderView(v, res.view, { height: 220 });
+    const meta = document.createElement('div'); meta.className = 'meta';
+    meta.innerHTML = `<span class="mono">query: ${esc(res.intent)}(${esc(JSON.stringify(res.params))})</span><span class="grow"></span>`;
+    const b = document.createElement('button'); b.className = 'btn-ghost btn-sm';
+    b.textContent = res.pushed ? '✓ On room screen' : 'Show on room screen';
+    b.onclick = async () => { await api('/api/p2/screen', { json: { question: res.question, answer: res.answer, view: res.view } }); b.textContent = '✓ On room screen'; };
+    meta.appendChild(b); box.appendChild(meta);
+  }
+  $('chat').scrollTop = $('chat').scrollHeight;
+}
+
+async function askText(text) {
+  text = (text || '').trim(); if (!text) return;
+  $('aInput').value = '';
+  const { a } = addQ(text);
+  try {
+    const res = await api('/api/p2/ask', { json: { question: text, lang: $('aLang').value, room: liveRoom(), push: $('autoScreen').checked } });
+    showAnswer(a, res);
+  } catch (e) { a.innerHTML = `<div class="ans" style="color:var(--err)">${esc(e.message)}</div>`; }
+}
+$('aSend').onclick = () => askText($('aInput').value);
+$('aInput').onkeydown = (e) => { if (e.key === 'Enter') askText($('aInput').value); };
+
+let micRec = null, micStream = null;
+$('micBtn').onclick = async () => {
+  if (micRec && micRec.state === 'recording') { micRec.stop(); return; }
+  try { micStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { toast('Microphone not available', 'err'); return; }
+  const chunks = [];
+  micRec = new MediaRecorder(micStream);
+  micRec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  micRec.onstop = async () => {
+    $('micBtn').classList.remove('on'); micStream.getTracks().forEach(t => t.stop());
+    const blob = new Blob(chunks, { type: micRec.mimeType || 'audio/webm' });
+    const { q, a } = addQ('…listening');
+    const fd = new FormData();
+    fd.append('audio', blob, 'question.' + (blob.type.includes('mp4') ? 'm4a' : 'webm'));
+    fd.append('lang', $('aLang').value); fd.append('room', liveRoom()); fd.append('push', $('autoScreen').checked);
+    try {
+      const res = await api('/api/p2/ask_audio', { method: 'POST', body: fd });
+      q.innerHTML = '<span class="heard">🎙 heard</span>' + esc(res.heard || res.question);
+      showAnswer(a, res);
+    } catch (e) { q.textContent = '🎙'; a.innerHTML = `<div class="ans" style="color:var(--err)">${esc(e.message)}</div>`; }
+  };
+  micRec.start(); $('micBtn').classList.add('on');
+};
+$('resetScreen').onclick = async () => { await api('/api/p2/screen', { json: { view: null } }); toast('Room screen shows the overview again'); };
+
+// ---------------------------------------------------------------- dashboard
+async function loadDashboard(district) {
+  const data = district ? await api('/api/p2/district/' + encodeURIComponent(district)) : await api('/api/p2/overview');
+  const dash = $('dash'); dash.innerHTML = '';
+  for (const v of data.views) {
+    const c = document.createElement('div'); c.className = 'card'; dash.appendChild(c);
+    const body = document.createElement('div'); c.appendChild(body); renderView(body, v);
+    const act = document.createElement('div'); act.className = 'card-actions';
+    const b = document.createElement('button'); b.className = 'btn-ghost btn-sm'; b.textContent = 'Show on room screen';
+    b.onclick = async () => { await api('/api/p2/screen', { json: { question: '', answer: '', view: v } }); toast('Sent to the room screen'); };
+    act.appendChild(b); c.appendChild(act);
+  }
+}
+api('/api/p2/catalog').then(c => {
+  $('dDistrict').insertAdjacentHTML('beforeend', c.districts.map(d => `<option>${esc(d.name)}</option>`).join(''));
+});
+$('dDistrict').onchange = () => loadDashboard($('dDistrict').value);
+
+// ---------------------------------------------------------------- minutes
+let mom = null;
+async function loadMoms() {
+  const { moms } = await api('/api/p2/moms');
+  $('mlist').innerHTML = moms.length ? moms.map(m => `
+    <div class="mitem ${mom && mom.id === m.id ? 'on' : ''}" data-id="${esc(m.id)}">
+      <div class="row"><span class="t grow">${esc(m.title)}</span><span class="pill ${m.status}">${esc(m.status)}</span></div>
+      <div class="s">${esc(m.date)} ${esc(m.time)} · ${m.participants} participants · ${m.open_actions} open actions</div></div>`).join('')
+    : '<div class="empty">No minutes yet.</div>';
+  $('mlist').querySelectorAll('.mitem').forEach(el => el.onclick = () => openMom(el.dataset.id));
+  const { meetings } = await api('/api/meetings');
+  $('fromMeeting').innerHTML = meetings.map(m => `<option value="${esc(m.id)}">${esc(m.name)} (${m.turns} lines)</option>`).join('') || '<option value="">No saved meetings</option>';
+}
+$('fromBtn').onclick = async () => {
+  const id = $('fromMeeting').value; if (!id) return;
+  $('fromBtn').disabled = true; $('fromBtn').textContent = 'Drafting…';
+  try { const m = await api('/api/p2/moms/from_meeting', { json: { meeting_id: id } }); await loadMoms(); openMom(m.id); toast('Draft minutes created'); }
+  catch (e) { toast(e.message, 'err'); }
+  finally { $('fromBtn').disabled = false; $('fromBtn').textContent = 'Draft'; }
+};
+
+const lines = arr => (arr || []).join('\n');
+const unlines = s => s.split('\n').map(x => x.trim()).filter(Boolean);
+
+async function openMom(id) {
+  mom = await api('/api/p2/moms/' + id);
+  renderEditor(); loadMoms();
+}
+
+function renderEditor() {
+  const m = mom, locked = m.status === 'approved';
+  const owners = ['Unassigned', ...m.participants];
+  const opt = (vals, cur) => vals.map(v => `<option ${v === cur ? 'selected' : ''}>${esc(v)}</option>`).join('');
+  $('editor').className = 'card' + (locked ? ' locked' : '');
+  $('editor').innerHTML = `
+    <div class="row"><div class="grow"><input id="eTitle" value="${esc(m.title)}" style="font-size:17px;font-weight:700"></div>
+      <span class="pill ${m.status}">${esc(m.status)}</span></div>
+    <p class="sub" style="margin:8px 0 0">${esc(m.date)} · ${esc(m.time)} · duration ${esc(m.duration)}
+      ${locked ? ` · approved by <b>${esc(m.approved_by)}</b> on ${new Date(m.approved_at * 1000).toLocaleString()}` : ''}</p>
+    <div class="row ed-sec"><div class="grow"><label class="lbl">Chaired by</label><input id="eChair" value="${esc(m.chair)}" placeholder="Name and designation"></div>
+      <div class="grow"><label class="lbl">Participants (comma separated)</label><input id="eParts" value="${esc(m.participants.join(', '))}"></div></div>
+    <div class="ed-sec"><h4>Summary</h4><textarea id="eSummary">${esc(m.summary)}</textarea></div>
+    <div class="ed-sec"><h4>Agenda (one per line)</h4><textarea id="eAgenda">${esc(lines(m.agenda))}</textarea></div>
+    <div class="ed-sec"><h4>Discussion</h4><div id="eDisc"></div>${locked ? '' : '<button class="btn-ghost btn-sm" id="addDisc">+ Topic</button>'}</div>
+    <div class="ed-sec"><h4>Decisions (one per line)</h4><textarea id="eDec">${esc(lines(m.decisions))}</textarea></div>
+    <div class="ed-sec"><h4>Action items</h4>
+      <table class="ai"><thead><tr><th style="width:20%">Owner</th><th>Task</th><th style="width:15%">Due</th><th style="width:12%">Priority</th><th style="width:13%">Status</th><th></th></tr></thead>
+      <tbody id="eAI"></tbody></table>${locked ? '' : '<button class="btn-ghost btn-sm" id="addAI" style="margin-top:6px">+ Action item</button>'}</div>
+    ${m.data_reviewed.length ? `<div class="ed-sec"><h4>Data reviewed during the meeting</h4>
+      ${m.data_reviewed.map(d => `<div class="small" style="margin-bottom:4px"><span class="mono muted">${esc(d.time)}</span> ${esc(d.item)}</div>`).join('')}
+      <div class="small" style="color:var(--warn)">Figures from sample data</div></div>` : ''}
+    <div class="ed-sec"><div class="row"><h4 class="grow" style="margin:0">Full conversation
+        <span class="muted" style="text-transform:none;letter-spacing:0">(${(m.transcript || []).length} lines)</span></h4>
+      ${(m.transcript || []).length ? '<button class="btn-ghost btn-sm" id="copyConv">Copy</button>' : ''}</div>
+      <div class="conv" id="eConv"></div></div>
+    <div class="row ed-sec" style="border-top:1px solid var(--border);padding-top:14px">
+      <button class="btn-ghost" id="saveMom">${locked ? 'Save action-item status' : 'Save draft'}</button>
+      ${locked ? '' : '<button class="btn-primary" id="approveMom">Approve minutes</button>'}
+      <span class="grow"></span>
+      <button class="btn-ghost" id="printMom">Print / PDF</button></div>`;
+
+  const conv = m.transcript || [];
+  $('eConv').innerHTML = conv.length ? conv.map(s => `
+    <div class="cline"><span class="ct">${fmtClock(s.start)}</span><span class="cw">${esc(s.speaker)}:</span>
+      <span class="cx">${esc(s.text)}${s.translation ? `<span class="ctr">EN: ${esc(s.translation)}</span>` : ''}</span></div>`).join('')
+    : '<div class="empty">No conversation was stored with these minutes.</div>';
+  if ($('copyConv')) $('copyConv').onclick = () => {
+    navigator.clipboard?.writeText(convText(conv)); toast('Conversation copied');
+  };
+  const disc = $('eDisc');
+  const drawDisc = () => {
+    disc.innerHTML = '';
+    m.discussion.forEach((d, i) => {
+      const box = document.createElement('div'); box.className = 'disc';
+      box.innerHTML = `<div class="row" style="margin-bottom:6px"><input class="grow" value="${esc(d.topic)}" data-k="topic">
+        ${locked ? '' : '<button class="btn-ghost btn-sm" title="Remove">✕</button>'}</div>
+        <textarea data-k="points">${esc(lines(d.points))}</textarea>`;
+      box.querySelector('[data-k=topic]').oninput = e => d.topic = e.target.value;
+      box.querySelector('[data-k=points]').oninput = e => d.points = unlines(e.target.value);
+      const rm = box.querySelector('button'); if (rm) rm.onclick = () => { m.discussion.splice(i, 1); drawDisc(); };
+      disc.appendChild(box);
+    });
+  };
+  drawDisc();
+  if ($('addDisc')) $('addDisc').onclick = () => { m.discussion.push({ topic: 'New topic', points: [] }); drawDisc(); };
+
+  const drawAI = () => {
+    $('eAI').innerHTML = '';
+    m.action_items.forEach((a, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td><select data-k="owner">${opt(owners.includes(a.owner) ? owners : [...owners, a.owner], a.owner)}</select></td>
+        <td><input data-k="task" value="${esc(a.task)}"></td><td><input data-k="due" value="${esc(a.due)}" placeholder="—"></td>
+        <td><select data-k="priority">${opt(['High', 'Medium', 'Low'], a.priority)}</select></td>
+        <td><select data-k="status" class="st">${opt(['Open', 'In progress', 'Done'], a.status)}</select></td>
+        <td>${locked ? '' : '<button class="btn-ghost btn-sm" title="Remove">✕</button>'}</td>`;
+      tr.querySelectorAll('[data-k]').forEach(el => el.oninput = el.onchange = () => a[el.dataset.k] = el.value);
+      const rm = tr.querySelector('button'); if (rm) rm.onclick = () => { m.action_items.splice(i, 1); drawAI(); };
+      $('eAI').appendChild(tr);
+    });
+    if (!m.action_items.length) $('eAI').innerHTML = '<tr><td colspan="6" class="muted small">No action items.</td></tr>';
+  };
+  drawAI();
+  if ($('addAI')) $('addAI').onclick = () => { m.action_items.push({ owner: 'Unassigned', task: '', due: '', priority: 'Medium', status: 'Open' }); drawAI(); };
+
+  $('saveMom').onclick = async () => {
+    const body = locked ? { action_items: m.action_items } : collect();
+    try { mom = await api('/api/p2/moms/' + m.id, { method: 'PUT', json: body }); toast('Saved'); renderEditor(); loadMoms(); }
+    catch (e) { toast(e.message, 'err'); }
+  };
+  if ($('approveMom')) $('approveMom').onclick = async () => {
+    const who = prompt('Approved by (name and designation):', m.chair || '');
+    if (!who) return;
+    try {
+      await api('/api/p2/moms/' + m.id, { method: 'PUT', json: collect() });
+      mom = await api(`/api/p2/moms/${m.id}/approve`, { json: { name: who } });
+      toast('Minutes approved'); renderEditor(); loadMoms();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  $('printMom').onclick = () => printMom(locked ? m : { ...m, ...collect() });
+}
+
+// "Name:   text" lines, names padded so the text lines up (as in a script).
+function convText(conv) {
+  const w = Math.max(0, ...conv.map(s => s.speaker.length)) + 2;
+  return conv.map(s => (s.speaker + ':').padEnd(w) + ' ' + s.text + (s.translation ? `\n${' '.repeat(w + 1)}EN: ${s.translation}` : '')).join('\n');
+}
+
+function collect() {
+  return {
+    title: $('eTitle').value.trim(), chair: $('eChair').value.trim(),
+    participants: $('eParts').value.split(',').map(s => s.trim()).filter(Boolean),
+    summary: $('eSummary').value.trim(), agenda: unlines($('eAgenda').value),
+    discussion: mom.discussion, decisions: unlines($('eDec').value), action_items: mom.action_items,
+  };
+}
+
+function printMom(m) {
+  const w = window.open('', '_blank');
+  const li = arr => arr.length ? `<ol>${arr.map(x => `<li>${esc(x)}</li>`).join('')}</ol>` : '<p>—</p>';
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(m.title)} — Minutes</title>
+  <style>body{font-family:'Noto Sans Devanagari',Arial,sans-serif;color:#111;max-width:800px;margin:32px auto;padding:0 24px;line-height:1.5;font-size:14px}
+  h1{font-size:20px;margin:0}h2{font-size:15px;margin:22px 0 6px;border-bottom:1px solid #ccc;padding-bottom:4px}
+  table{width:100%;border-collapse:collapse}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}
+  th{background:#f2f2f2}.meta{color:#444;margin-top:6px}.foot{margin-top:28px;font-size:12px;color:#555}
+  .status{display:inline-block;padding:2px 8px;border:1px solid #999;border-radius:4px;font-size:11px;text-transform:uppercase}</style></head><body>
+  <div style="font-size:12px;color:#555">Water Supply &amp; Sanitation Department — Minutes of Meeting</div>
+  <h1>${esc(m.title)}</h1>
+  <div class="meta">${esc(m.date)} · ${esc(m.time)} · Duration ${esc(m.duration)} · <span class="status">${esc(m.status)}</span></div>
+  <div class="meta"><b>Chaired by:</b> ${esc(m.chair || '—')}</div>
+  <div class="meta"><b>Participants:</b> ${esc(m.participants.join(', '))}</div>
+  <h2>Summary</h2><p>${esc(m.summary)}</p>
+  <h2>Agenda</h2>${li(m.agenda)}
+  <h2>Discussion</h2>${m.discussion.map(d => `<p><b>${esc(d.topic)}</b></p>${li(d.points)}`).join('') || '<p>—</p>'}
+  <h2>Decisions</h2>${li(m.decisions)}
+  <h2>Action items</h2><table><tr><th>#</th><th>Owner</th><th>Task</th><th>Due</th><th>Priority</th><th>Status</th></tr>
+  ${m.action_items.map((a, i) => `<tr><td>${i + 1}</td><td>${esc(a.owner)}</td><td>${esc(a.task)}</td><td>${esc(a.due || '—')}</td><td>${esc(a.priority)}</td><td>${esc(a.status)}</td></tr>`).join('')}</table>
+  ${m.data_reviewed.length ? `<h2>Data reviewed during the meeting</h2>${li(m.data_reviewed.map(d => d.time + ' — ' + d.item))}<p style="font-size:12px;color:#a60">Figures from sample data (demonstration).</p>` : ''}
+  ${(m.transcript || []).length ? `<h2 style="page-break-before:always">Annexure — Full conversation</h2>
+  <table><tr><th style="width:52px">Time</th><th style="width:22%">Speaker</th><th>What was said</th></tr>
+  ${m.transcript.map(s => `<tr><td>${fmtClock(s.start)}</td><td>${esc(s.speaker)}</td><td>${esc(s.text)}${s.translation ? `<br><i style="color:#555">EN: ${esc(s.translation)}</i>` : ''}</td></tr>`).join('')}</table>` : ''}
+  <div class="foot">${m.status === 'approved' ? `Approved by ${esc(m.approved_by)} on ${new Date(m.approved_at * 1000).toLocaleString()}` : 'DRAFT — not yet approved for circulation'}</div>
+  <script>window.onload=()=>window.print()<\/script></body></html>`);
+  w.document.close();
+}
+</script>
+</body>
+</html>

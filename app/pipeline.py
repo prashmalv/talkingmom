@@ -320,6 +320,24 @@ def process_meeting(
         _p(100, "done")
         return {"segments": [], "transcript": "", "unresolved": []}
 
+    segments = build_transcript(wav, sr, turns, stt, language, translate, names, log, _p, t0)
+    transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments)
+    return {
+        "segments": segments,
+        "transcript": transcript,
+        "unresolved": unresolved,
+    }
+
+
+def build_transcript(wav: np.ndarray, sr: int, turns: list[dict], stt: dict, language: str | None,
+                     translate: bool, names: list[str], log, _p, t0: float) -> list[dict]:
+    """Turn named speaker turns + Whisper words into finished transcript lines.
+
+    Shared by uploaded meetings (turns from diarization + voice ID) and Phase 2
+    meeting rooms (turns from each participant's own microphone). `turns` need
+    start/end/speaker/name; `stt` is {"res": transcribe_words(...)} or {"err": e}.
+    """
+    duration = len(wav) / sr
     if "err" in stt:
         log(f"⚠ Whole-file transcription failed ({stt['err']}); transcribing turn by turn instead")
     elif not stt.get("res"):
@@ -417,9 +435,4 @@ def process_meeting(
     who = sorted({s["speaker"] for s in segments})
     log(f"Transcript ready: {len(segments)} lines, {len(who)} speakers ({', '.join(who)}) — "
         f"{duration:.0f}s of audio in {took:.0f}s ({took / max(duration, 1):.2f}× real time)")
-    transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments)
-    return {
-        "segments": segments,
-        "transcript": transcript,
-        "unresolved": unresolved,
-    }
+    return segments

@@ -217,6 +217,52 @@ Lines are tagged with the job id (`[c4668586  12.3s]`). The latest line is also 
 
 ---
 
+## Phase 2 POC — AI-Enabled Meeting Room
+
+A separate screen at **`/phase2`** (switch with the header link; the MoM screen above is unchanged) that demonstrates the *AI-Enabled Meeting Room* from the CCC concept note:
+
+| Concept-note use case | Where |
+|---|---|
+| Display status of a district / scheme | **Ask the data** — "Show the status of Pune district" |
+| Retrieve operational information | **Ask the data** — "How many grievances are overdue in Nagpur division?" |
+| Compare district performance | **Ask the data** — "Compare Nashik and Nagpur on tap connections" |
+| Display dashboards on the room screen | **Dashboard** tab + **Room screen** (`/present`) |
+| Meeting summaries · MoM · action items | **Meeting room** → **Minutes & actions** (edit → approve → print) |
+
+> ⚠ **All scheme figures are synthetic sample data** (fixed seed, real district names). Every answer, chart and printed MoM says so. Real department systems are plugged in later by replacing `app/phase2/sample_data.py`.
+
+### Speakers named from accounts — no voice samples
+Each participant opens the **join link / QR code** on their **own phone or laptop**, types their name, and their device streams its own microphone. After the meeting every recording is placed on one timeline (clocks synced at join), and for each moment the speaker is the device whose mic hears speech loudest *relative to its own background noise*. Names therefore come from who joined. On a simulated 3-device meeting, 97% of speaking time was attributed correctly and every line had the right name. A room with only **one** device falls back to the Phase 1 voice recognition.
+
+### Governed data assistant
+Voice (mic button) or text, in English, Hindi or Marathi. GPT only **chooses** one of six fixed, read-only query types — `state_overview`, `district_status`, `compare`, `ranking`, `trend`, `anomalies` — with validated parameters; Python computes every number, then GPT phrases the result in the asker's language. It never writes SQL or invents figures, and each answer shows the query it ran. Questions asked during a live meeting are logged into the MoM under *Data reviewed*.
+
+### Running a Phase 2 meeting
+1. Other devices need **HTTPS** for the microphone, so start with:
+   ```bash
+   python run.py --https
+   ```
+   It creates a self-signed certificate (needs `openssl`, included with Git for Windows) and prints the address, e.g. `https://172.1.0.224:8443/phase2`. Each browser warns once about the certificate → **Advanced → Proceed**. All devices must be on the same network.
+2. On the host PC open `/phase2` → **Create meeting room** → share the QR code / link.
+3. Each participant opens it on their own device, enters their name → **Join with microphone**.
+4. Host clicks **Start meeting**; open **Room screen ↗** on the TV/projector. Ask questions any time.
+5. **End meeting & prepare minutes** → transcript with names → **Open minutes** → edit, **Approve**, **Print / PDF**.
+
+Formal minutes can also be drafted from any meeting saved on the MoM screen (**Minutes & actions → Draft**).
+
+### Google Meet bot (live, names from Meet accounts)
+On **Meeting room → Google Meet bot**, paste a Meet link and click **Send bot to the meeting**. A real Chrome window ("MoM Assistant") joins the call — the host clicks **Admit**. While the meeting runs the bot records the call's incoming audio and switches on Meet's captions, which label every utterance with the speaker's **Google account name**. Afterwards Whisper transcribes the recording and each word goes to the caption speaker of that moment; then translation, formal MoM and action items as usual. **Stop bot & prepare minutes** makes it leave (it also notices when the host ends the call for everyone).
+
+- **One-time setup:** Google doesn't admit guests without an account into meetings hosted by personal accounts, so the bot must be signed in. Create a Google account for it (e.g. "MoM Assistant"), click **Sign in bot's Google account**, sign in in the Chrome window that opens, then **close that window**. The profile is kept in `data/phase2/meet_profile/` (git-ignored).
+- Needs **Google Chrome** and `playwright` (in `requirements.txt`; it drives the installed Chrome — no extra browser download). Google blocks hidden (headless) browsers, so the bot's window is visible; keep it open and the PC awake during the meeting.
+- Each participant must join from **their own device and Google account** — people sharing one device appear under one name.
+- The bot saves what Meet's caption area looked like to `data/phase2/rooms/<code>/captions_debug.txt` — use it to diagnose wrong names if Google changes Meet's page.
+- Demo-grade: Meet's page isn't an API, so a Meet redesign can break joining or caption reading.
+
+Every set of minutes keeps the **full conversation** (time · speaker · what was said, plus the English translation for Hindi/Marathi). It's shown at the bottom of the minutes, **Copy** gives it as a plain script (`Name:   text`), and **Print / PDF** adds it as an *Annexure — Full conversation*.
+
+---
+
 ## Configuration (`.env`)
 
 | Variable | Default | Purpose |
@@ -264,10 +310,23 @@ app/
   config.py          Reads .env, defines paths
   startup_check.py   Preflight health report printed at boot
   run_log.py         Step-by-step processing log printed to the terminal
+  jobs.py            One-at-a-time background job queue (shared by both screens)
+  phase2/            Phase 2 POC — AI meeting room
+    rooms.py         Account-based meeting rooms (per-device audio → who spoke when)
+    meet_bot.py      Google Meet bot (Playwright-driven Chrome: call audio + caption speaker names)
+    assistant.py     Governed data assistant (question → whitelisted query → chart + answer)
+    sample_data.py   SYNTHETIC district × scheme dataset (36 districts, 12 months)
+    mom.py           Formal MoM: structured draft → edit → approve
+    routes.py        /api/p2/... endpoints
 frontend/
-  index.html         Entire UI (HTML + CSS + JS in one file)
-data/                Runtime data — auto-created, git-ignored (voices, meetings, DB)
-run.py               Starts Uvicorn on http://localhost:8000
+  index.html         MoM screen (HTML + CSS + JS in one file)
+  phase2.html        Phase 2: meeting room, assistant, dashboard, minutes
+  join.html          Participant page (each person's own device)
+  present.html       Full-screen meeting-room display
+  p2.css, p2.js      Shared Phase 2 styles and chart rendering
+data/                Runtime data — auto-created, git-ignored (voices, meetings, DB, Phase 2 rooms/minutes)
+certs/               Self-signed HTTPS certificate (created by --https, git-ignored)
+run.py               Starts Uvicorn on http://localhost:8000 (or --https on :8443)
 requirements.txt     Pinned Python dependencies
 .env.example         Configuration template (copy to .env)
 ```
@@ -291,6 +350,23 @@ requirements.txt     Pinned Python dependencies
 | `GET` | `/api/meetings/{id}/data` | Load a saved meeting |
 | `DELETE` | `/api/meetings/{id}` | Delete a saved meeting |
 | `GET` | `/api/meetings/{audio_id}/audio` | Stream meeting audio |
+
+**Phase 2 (`/api/p2/...`)**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/p2/ask` | JSON: `question`, `lang?`, `room?`, `push?` — governed data question |
+| `POST` | `/api/p2/ask_audio` | Form: `audio`, `lang`, `room`, `push` — spoken question |
+| `GET` | `/api/p2/overview` · `/api/p2/district/{name}` · `/api/p2/catalog` | Dashboard views / available data |
+| `GET` / `POST` | `/api/p2/screen` | Read / set what the room screen shows |
+| `POST` | `/api/p2/rooms` | Create a meeting room → code |
+| `GET` | `/api/p2/rooms/{code}` | Room status (participants, state, job) |
+| `POST` | `/api/p2/rooms/{code}/join` · `/start` · `/end` | Join by name / start / end the meeting |
+| `POST` | `/api/p2/rooms/{code}/audio?pid&seq&final&start_ts&ext` | Upload one recording chunk (raw body) |
+| `GET` | `/api/p2/rooms/{code}/result` | Transcript + MoM id after processing |
+| `GET` / `PUT` | `/api/p2/moms` · `/api/p2/moms/{id}` | List / read / edit minutes |
+| `POST` | `/api/p2/moms/{id}/approve` · `/api/p2/moms/from_meeting` | Approve (locks) / draft from a saved MoM meeting |
+| `GET` | `/api/p2/time` | Server clock (devices sync to it) |
 
 Interactive docs: http://localhost:8000/docs
 
@@ -327,6 +403,7 @@ This is an internal demo, **not production-hardened**:
 - Single shared speaker database (no multi-user isolation)
 - Jobs are kept in memory — lost if the server restarts (the page then says so instead of waiting forever)
 - Meetings are processed one at a time; with several users, later uploads wait in the queue
+- Phase 2: all scheme data is **synthetic**; meeting rooms live in memory (a server restart loses an unfinished room); people sharing one device in a room are treated as one speaker (one device per person, or one device for the whole room which then uses voice recognition); no login/roles yet
 - Uploaded audio is never cleaned up automatically
 - PDF export uses a Latin font, so Devanagari text doesn't render correctly in the PDF
 - Very long meetings may exceed LLM context limits for polish / translate / summary

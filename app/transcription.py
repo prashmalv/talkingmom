@@ -114,7 +114,8 @@ def _load_fw(model_id: str) -> WhisperModel:
     return m
 
 
-def _fw_run(wav: np.ndarray, model_id: str, language: str | None, task: str) -> str:
+def _fw_run(wav: np.ndarray, model_id: str, language: str | None, task: str,
+            prompt: str | None = None) -> str:
     model = _load_fw(model_id)
     opts = _decode_opts(language)
     opts["condition_on_previous_text"] = False  # single short turn
@@ -125,7 +126,7 @@ def _fw_run(wav: np.ndarray, model_id: str, language: str | None, task: str) -> 
         best_of=WHISPER_BEAM_SIZE,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200, threshold=0.5),
-        initial_prompt=None,
+        initial_prompt=prompt,
         no_speech_threshold=0.7,
         suppress_blank=True,
         **opts,
@@ -177,7 +178,7 @@ def get_model_id(language: str | None) -> str:
     return override or WHISPER_MODEL
 
 
-def _run(wav: np.ndarray, language: str | None, task: str) -> str:
+def _run(wav: np.ndarray, language: str | None, task: str, prompt: str | None = None) -> str:
     if wav.size < 1600:
         return ""
     lang = language if language and language != "auto" else None
@@ -201,8 +202,12 @@ def _run(wav: np.ndarray, language: str | None, task: str) -> str:
     else:
         print(f"[STT] {task}: lang={lang or 'auto'} → faster-whisper [{model_id}]", flush=True)
         try:
-            text = _fw_run(wav, model_id, lang, task)
+            text = _fw_run(wav, model_id, lang, task, prompt)
         except Exception as e:
+            if "/" not in model_id:
+                # Built-in names (large-v3, small…) aren't HuggingFace repos — no fallback exists.
+                print(f"[STT] ⚠ faster-whisper failed on a segment ({e}); skipping it", flush=True)
+                return ""
             print(f"[STT] ⚠ faster-whisper failed ({e}); trying HuggingFace [{model_id}]", flush=True)
             text = _hf_run(wav, model_id, lang, task)
     return _clean(text)
@@ -252,6 +257,10 @@ def transcribe_words(
     """
     audio = wav.astype(np.float32)
     lang = language if language and language != "auto" else None
+    if audio.size == 0 or float(np.abs(audio).max()) < 1e-4:
+        # Silent recording: faster-whisper's language detection crashes on it.
+        log("Whisper: the recording is silent — nothing to transcribe")
+        return {"words": [], "language": lang or "en", "model": "(none — silent audio)"}
 
     def _start(model_id: str, lang_: str | None):
         # transcribe() detects the language eagerly; segments decode lazily.
@@ -271,7 +280,15 @@ def transcribe_words(
         # Auto: let the fast English model detect the language. If it's
         # English, it does the whole job; otherwise hand off to the right model.
         model_id = WHISPER_MODEL_EN
-        segments, info = _start(model_id, None)
+        try:
+            segments, info = _start(model_id, None)
+        except ValueError as e:
+            # faster-whisper's language detection fails when its voice-activity
+            # filter finds no speech at all (e.g. a recording of a test tone).
+            if "empty" not in str(e):
+                raise
+            log("Whisper: no speech found in the recording — nothing to transcribe")
+            return {"words": [], "language": "en", "model": f"{model_id} (no speech found)"}
         log(f"Whisper: language detected = {info.language} "
             f"({info.language_probability:.0%} sure, by '{model_id}')")
         if info.language != "en":
@@ -303,8 +320,8 @@ def transcribe_words(
     return {"words": words, "language": lang or getattr(info, "language", None), "model": model_id}
 
 
-def transcribe_segment(wav: np.ndarray, language: str | None = None) -> str:
-    return _run(wav, language, task="transcribe")
+def transcribe_segment(wav: np.ndarray, language: str | None = None, prompt: str | None = None) -> str:
+    return _run(wav, language, task="transcribe", prompt=prompt)
 
 
 def translate_segment(wav: np.ndarray, language: str | None = None) -> str:

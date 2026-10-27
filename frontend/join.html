@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Join Meeting</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/p2.css">
+<style>
+  main { max-width: 460px; margin: 0 auto; padding: 32px 16px 60px; }
+  .big-code { font: 700 22px/1 'JetBrains Mono', monospace; letter-spacing: .2em; }
+  .state { font-size: 20px; font-weight: 700; margin: 4px 0 6px; }
+  .meter { height: 10px; border-radius: 999px; background: var(--hover-bg); overflow: hidden; margin: 16px 0 6px; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--grad); transition: width .08s; }
+  .you { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: var(--radius-sm);
+    background: var(--hover-bg); border: 1px solid var(--border); margin-bottom: 14px; }
+  .av { width: 40px; height: 40px; border-radius: 50%; background: var(--grad); display: grid; place-items: center; font-weight: 800; }
+  .hint { font-size: 12.5px; color: var(--fg-dim); line-height: 1.55; margin-top: 12px; }
+  .warnbox { padding: 12px; border-radius: var(--radius-sm); border: 1px solid rgba(251,191,36,.4);
+    background: rgba(251,191,36,.08); font-size: 13px; line-height: 1.5; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4"/></svg></div>
+    <div><h1>AI Meeting Room</h1><p>Join as a participant</p></div>
+  </div>
+  <span class="badge" id="codeBadge">—</span>
+</header>
+<main>
+  <div class="warnbox" id="insecure" hidden>
+    This page isn't on HTTPS, so the browser won't allow the microphone. Ask the host for the
+    <b>https://</b> link (start the server with <code>python run.py --https</code>).
+  </div>
+
+  <section class="card" id="joinCard">
+    <h2>Join meeting</h2>
+    <p class="sub">Your name is how you'll appear in the transcript and minutes — no voice sample needed.</p>
+    <label class="lbl" for="code">Meeting code</label>
+    <input id="code" class="mono" placeholder="e.g. XMTXD" autocomplete="off" style="text-transform:uppercase;margin-bottom:12px">
+    <label class="lbl" for="name">Your name</label>
+    <input id="name" placeholder="e.g. Dipanshu Chauhan" autocomplete="name" style="margin-bottom:16px">
+    <button class="btn-primary" id="joinBtn" style="width:100%">Join with microphone</button>
+    <p class="hint">Use your own device and keep it close to you. Everyone in the meeting joins the same way —
+      the speaker is whoever's own microphone hears them best.</p>
+  </section>
+
+  <section class="card" id="liveCard" hidden>
+    <div class="you"><div class="av" id="av">?</div>
+      <div class="grow"><div style="font-weight:700" id="youName"></div>
+        <div class="small muted" id="meetingTitle"></div></div>
+      <span class="badge"><span class="dot" id="recDot"></span><span id="recLabel">Connected</span></span></div>
+    <div class="state" id="state">Waiting for the host to start…</div>
+    <div class="small muted" id="stateSub">Your microphone is ready. Recording starts automatically.</div>
+    <div class="meter"><i id="meter"></i></div>
+    <div class="row small muted"><span>Mic level</span><span class="grow"></span><span class="mono" id="clock">0:00</span></div>
+    <p class="hint">Keep this page open until the host ends the meeting. Minutes are prepared on the host's screen.</p>
+  </section>
+</main>
+<script src="/static/p2.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+if (params.get('room')) $('code').value = params.get('room').toUpperCase();
+if (!window.isSecureContext) $('insecure').hidden = false;
+try { $('name').value = localStorage.getItem('mom-join-name') || ''; } catch (e) {}
+
+let code, pid, stream, recorder, clockOffset = 0, seq = 0, uploadChain = Promise.resolve(), startedAt = 0, state = '';
+
+async function syncClock() {
+  // Several round trips; keep the one with the smallest delay.
+  let best = null;
+  for (let i = 0; i < 5; i++) {
+    const t0 = Date.now(); const j = await api('/api/p2/time'); const t1 = Date.now();
+    const s = { rtt: t1 - t0, off: j.now * 1000 - (t0 + t1) / 2 };
+    if (!best || s.rtt < best.rtt) best = s;
+  }
+  return best.off;
+}
+
+function pickMime() {
+  for (const t of ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'])
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+  return '';
+}
+
+function upload(blob, final, startTs) {
+  const mySeq = seq++;
+  const mime = recorder.mimeType || 'audio/webm';
+  const ext = mime.includes('mp4') ? 'mp4' : mime.includes('ogg') ? 'ogg' : 'webm';
+  const q = new URLSearchParams({ pid, seq: mySeq, final: final ? 1 : 0, ext });
+  if (startTs) q.set('start_ts', startTs);
+  // Chunks go up strictly in order; retry a few times on network hiccups.
+  uploadChain = uploadChain.then(async () => {
+    for (let a = 0; a < 4; a++) {
+      try {
+        const r = await fetch(`/api/p2/rooms/${code}/audio?${q}`, { method: 'POST', body: blob });
+        if (r.ok || r.status === 409) return;
+      } catch (e) {}
+      await new Promise(res => setTimeout(res, 800 * (a + 1)));
+    }
+  });
+  return uploadChain;
+}
+
+function startRecording() {
+  const mime = pickMime();
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  let first = true;
+  recorder.ondataavailable = (e) => {
+    if (!e.data || !e.data.size) return;
+    upload(e.data, false, first ? startedAt : null);
+    first = false;
+  };
+  recorder.onstart = () => { startedAt = (Date.now() + clockOffset) / 1000; };
+  recorder.onstop = () => { upload(new Blob([]), true); };
+  recorder.start(3000);
+}
+
+function meterLoop() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const an = ctx.createAnalyser(); an.fftSize = 512;
+  ctx.createMediaStreamSource(stream).connect(an);
+  const buf = new Uint8Array(an.fftSize);
+  (function tick() {
+    an.getByteTimeDomainData(buf);
+    let peak = 0; for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+    $('meter').style.width = Math.min(100, peak * 1.6) + '%';
+    requestAnimationFrame(tick);
+  })();
+}
+
+function setState(s, room) {
+  $('meetingTitle').textContent = room.title;
+  if (s === state) { if (s === 'live') $('clock').textContent = fmtClock(room.elapsed_s); return; }
+  state = s;
+  if (s === 'lobby') {
+    $('state').textContent = 'Waiting for the host to start…';
+    $('stateSub').textContent = 'Your microphone is ready. Recording starts automatically.';
+  } else if (s === 'live') {
+    $('state').textContent = 'Meeting in progress';
+    $('stateSub').textContent = 'You are being recorded under your name. Speak normally.';
+    $('recDot').classList.add('rec'); $('recLabel').textContent = 'Recording';
+    if (!recorder) startRecording();
+  } else {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    stream && stream.getTracks().forEach(t => t.stop());
+    $('recDot').classList.remove('rec'); $('recLabel').textContent = 'Done';
+    $('state').textContent = 'Meeting ended — thank you';
+    $('stateSub').textContent = s === 'done' ? 'Minutes are ready on the host screen.' : 'Uploading your audio… the host is preparing the minutes.';
+  }
+}
+
+async function poll() {
+  try {
+    const room = await api(`/api/p2/rooms/${code}?pid=${pid}`);
+    setState(room.state, room);
+    if (room.state === 'done' || room.state === 'error') return;
+  } catch (e) {}
+  setTimeout(poll, 1500);
+}
+
+$('joinBtn').onclick = async () => {
+  code = $('code').value.trim().toUpperCase();
+  const name = $('name').value.trim();
+  if (!code || !name) { toast('Enter the meeting code and your name', 'err'); return; }
+  $('joinBtn').disabled = true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+  } catch (e) {
+    toast(window.isSecureContext ? 'Microphone permission denied' : 'Microphone needs an https:// link', 'err');
+    $('joinBtn').disabled = false; return;
+  }
+  try {
+    clockOffset = await syncClock();
+    const j = await api(`/api/p2/rooms/${code}/join`, { json: { name } });
+    pid = j.pid;
+    try { localStorage.setItem('mom-join-name', name); } catch (e) {}
+    $('youName').textContent = j.name;
+    $('av').textContent = j.name.split(/\s+/).map(p => p[0]).slice(0, 2).join('').toUpperCase();
+    $('codeBadge').textContent = 'Meeting ' + code;
+    $('joinCard').hidden = true; $('liveCard').hidden = false;
+    meterLoop();
+    setState(j.room.state, j.room);
+    poll();
+  } catch (e) {
+    toast(e.message, 'err'); $('joinBtn').disabled = false;
+    stream.getTracks().forEach(t => t.stop());
+  }
+};
+// Warn before closing mid-meeting — that would cut this person's audio.
+window.addEventListener('beforeunload', (e) => { if (state === 'live') { e.preventDefault(); e.returnValue = ''; } });
+</script>
+</body>
+</html>

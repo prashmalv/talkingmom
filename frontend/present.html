@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Meeting Room Screen</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/p2.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  body { overflow-x: hidden; }
+  header.top { padding: 16px 32px; }
+  .brand h1 { font-size: 20px; }
+  .clock { font: 600 22px 'JetBrains Mono', monospace; color: var(--fg-dim); }
+  main { padding: 24px 32px 32px; }
+  .qa { margin-bottom: 18px; }
+  .qa .q { font-size: 18px; color: var(--fg-dim); }
+  .qa .q b { color: var(--accent-2); font-weight: 600; }
+  .qa .a { font-size: 26px; font-weight: 700; line-height: 1.35; margin-top: 8px; letter-spacing: -.01em; }
+  #focus .view-head h3 { font-size: 24px; } #focus .view-head p { font-size: 15px; }
+  #focus .kpi .k-val { font-size: 44px; } #focus .kpi .k-label { font-size: 16px; }
+  #focus .kpi .k-delta { font-size: 15px; } #focus .chart-box { height: min(58vh, 560px); }
+  #focus table.data { font-size: 18px; } #focus .view-foot { font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 18px; }
+  .grid .chart-box { height: 240px; }
+  .idle-title { font-size: 14px; text-transform: uppercase; letter-spacing: .12em; color: var(--mut); margin: 0 0 14px; }
+  @media (max-width: 640px) { header.top, main { padding-left: 16px; padding-right: 16px; } .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></div>
+    <div><h1>AI-Enabled Meeting Room</h1><p id="roomLine">Water Supply &amp; Sanitation — review dashboard</p></div>
+  </div>
+  <div class="row"><span class="badge sample">● Sample data</span><span class="clock" id="clock"></span></div>
+</header>
+<main>
+  <section id="focusWrap" hidden>
+    <div class="qa"><div class="q" id="q"></div><div class="a" id="a"></div></div>
+    <div class="card" id="focus"></div>
+  </section>
+  <section id="idle">
+    <p class="idle-title">State overview — ask the assistant to show anything on this screen</p>
+    <div class="grid" id="grid"></div>
+  </section>
+</main>
+<script src="/static/p2.js"></script>
+<script>
+setInterval(() => { $('clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }, 1000);
+
+async function loadIdle() {
+  const { views } = await api('/api/p2/overview');
+  const grid = $('grid'); grid.innerHTML = '';
+  for (const v of views) {
+    const c = document.createElement('div'); c.className = 'card'; grid.appendChild(c);
+    renderView(c, v);
+  }
+}
+
+let version = -1;
+async function poll() {
+  try {
+    const s = await api('/api/p2/screen');
+    if (s.version !== version) {
+      version = s.version;
+      if (s.item && s.item.view) {
+        $('q').innerHTML = s.item.question ? `<b>Asked:</b> ${esc(s.item.question)}` : '';
+        $('a').textContent = s.item.answer || '';
+        $('focusWrap').hidden = false; $('idle').hidden = true;
+        renderView($('focus'), s.item.view, { big: true });
+      } else {
+        $('focusWrap').hidden = true; $('idle').hidden = false;
+      }
+    }
+  } catch (e) {}
+  setTimeout(poll, 1000);
+}
+loadIdle().then(poll);
+</script>
+</body>
+</html>
