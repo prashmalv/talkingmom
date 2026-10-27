@@ -138,7 +138,7 @@
         <div id="botBox" hidden style="margin-top:16px">
           <div class="person" style="align-items:flex-start">
             <div class="av">🤖</div>
-            <div class="grow"><div style="font-weight:600">MoM Assistant <span class="small muted">in Google Meet</span></div>
+            <div class="grow"><div style="font-weight:600">AI Assistant <span class="small muted">in Google Meet</span></div>
               <div class="small" id="botDetail" style="margin-top:2px"></div>
               <div class="link" id="botUrl" style="margin-top:4px"></div></div>
           </div>
@@ -254,7 +254,7 @@ document.querySelectorAll('#srcSwitch a').forEach(a => a.onclick = (e) => {
   document.querySelectorAll('#srcSwitch a').forEach(x => x.classList.toggle('on', x === a));
   $('meetBox').hidden = src !== 'meet';
   $('srcHelp').textContent = src === 'meet'
-    ? 'Paste a Google Meet link. “MoM Assistant” joins the call — admit it in Meet. Speaker names come from Meet accounts.'
+    ? 'Paste a Google Meet link. “AI Assistant” joins the call — admit it in Meet. Speaker names come from Meet accounts.'
     : 'Participants join from their own phone or laptop under their name — no voice samples needed.';
   $('createBtn').textContent = src === 'meet' ? 'Send bot to the meeting' : 'Create meeting room';
 });
@@ -264,7 +264,7 @@ async function refreshSignin() {
     const s = await api('/api/p2/meet/signin');
     $('botSigninState').textContent = s.signed_in_once
       ? `Sign-in window last opened ${s.since}. Close that Chrome window before sending the bot.`
-      : 'One time: Google only admits signed-in bots. Use a Google account made for the bot (e.g. “MoM Assistant”).';
+      : 'One time: Google only admits signed-in bots. Use a Google account made for the bot (e.g. “AI Assistant”).';
   } catch (e) {}
 }
 refreshSignin();

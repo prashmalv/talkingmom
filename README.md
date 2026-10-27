@@ -251,11 +251,13 @@ Voice (mic button) or text, in English, Hindi or Marathi. GPT only **chooses** o
 Formal minutes can also be drafted from any meeting saved on the MoM screen (**Minutes & actions → Draft**).
 
 ### Google Meet bot (live, names from Meet accounts)
-On **Meeting room → Google Meet bot**, paste a Meet link and click **Send bot to the meeting**. A real Chrome window ("MoM Assistant") joins the call — the host clicks **Admit**. While the meeting runs the bot records the call's incoming audio and switches on Meet's captions, which label every utterance with the speaker's **Google account name**. Afterwards Whisper transcribes the recording and each word goes to the caption speaker of that moment; then translation, formal MoM and action items as usual. **Stop bot & prepare minutes** makes it leave (it also notices when the host ends the call for everyone).
+On **Meeting room → Google Meet bot**, paste a Meet link and click **Send bot to the meeting**. A real Chrome window ("AI Assistant") joins the call — the host clicks **Admit**. While the meeting runs the bot records what Meet plays and switches on Meet's captions, which label every utterance with the speaker's **Google account name**. Afterwards Whisper transcribes the recording and each word goes to the caption speaker of that moment; then translation, formal MoM and action items as usual. **Stop bot & prepare minutes** makes it leave (it also notices when the host ends the call for everyone).
 
-- **One-time setup:** Google doesn't admit guests without an account into meetings hosted by personal accounts, so the bot must be signed in. Create a Google account for it (e.g. "MoM Assistant"), click **Sign in bot's Google account**, sign in in the Chrome window that opens, then **close that window**. The profile is kept in `data/phase2/meet_profile/` (git-ignored).
+- **One-time setup:** Google doesn't admit guests without an account into meetings hosted by personal accounts, so the bot must be signed in. Create a Google account for it (e.g. "AI Assistant"), click **Sign in bot's Google account**, sign in in the Chrome window that opens, then **close that window**. The profile is kept in `data/phase2/meet_profile/` (git-ignored).
 - Needs **Google Chrome** and `playwright` (in `requirements.txt`; it drives the installed Chrome — no extra browser download). Google blocks hidden (headless) browsers, so the bot's window is visible; keep it open and the PC awake during the meeting.
 - Each participant must join from **their own device and Google account** — people sharing one device appear under one name.
+- **Better words:** Meet's English captions are kept as a *second opinion*. When GPT corrects the transcript it sees each Whisper line next to what Meet heard at that moment, and takes Meet's word where Whisper's makes no sense (e.g. "a cricket bowl and a bowl" → "a cricket bat and a ball"). Used for English lines only.
+- **How it records:** Meet plays voices through the browser's Web Audio engine (no `<audio>` players), and its raw WebRTC tracks can be silent to scripts. The bot taps several places at once — Web Audio output, incoming call tracks, media-element streams — and every second records from whichever carries sound. Every 15 s the terminal prints an `audio check` line (`recording_from`, per-source levels, bytes received); levels stuck at `0.0000` mean the recording is silent.
 - The bot saves what Meet's caption area looked like to `data/phase2/rooms/<code>/captions_debug.txt` — use it to diagnose wrong names if Google changes Meet's page.
 - Demo-grade: Meet's page isn't an API, so a Meet redesign can break joining or caption reading.
 
@@ -389,7 +391,7 @@ Interactive docs: http://localhost:8000/docs
 | Two people's lines under one speaker | Raise `SPEAKER_CLUSTER_SIMILARITY` (e.g. `0.4`). The terminal log shows "grouped N turns into M voices" |
 | One person split into two speakers | Lower `SPEAKER_CLUSTER_SIMILARITY` (e.g. `0.2`) |
 | Lines show a wrong language / script (e.g. Urdu) | Choose the meeting language explicitly instead of Auto, or re-enroll that person speaking their usual language |
-| Mis-heard words | Set `POLISH_TRANSCRIPT=true`; enroll participants (their names are used as vocabulary); improve audio quality |
+| Mis-heard words | Set `POLISH_TRANSCRIPT=true`; enroll participants (their names are used as vocabulary); improve audio quality. For higher English accuracy set `WHISPER_MODEL_EN=medium` (≈2–3× slower than `small`) or `large-v3` (slowest) |
 | "Failed to fetch" during processing | Don't run Uvicorn with `--reload` (file writes restart the server) |
 | Mic recording doesn't work on another machine | Browsers only allow the mic on `localhost` or HTTPS |
 
@@ -406,7 +408,7 @@ This is an internal demo, **not production-hardened**:
 - Phase 2: all scheme data is **synthetic**; meeting rooms live in memory (a server restart loses an unfinished room); people sharing one device in a room are treated as one speaker (one device per person, or one device for the whole room which then uses voice recognition); no login/roles yet
 - Uploaded audio is never cleaned up automatically
 - PDF export uses a Latin font, so Devanagari text doesn't render correctly in the PDF
-- Very long meetings may exceed LLM context limits for polish / translate / summary
+- Long meetings: polish and translation run 40 lines at a time (with the preceding lines as context), so no lines are lost; on CPU a 1-hour English meeting takes ~25–40 min to process, Hindi/Marathi ~3 h — a GPU brings both to ~5–10 min
 
 ---
 

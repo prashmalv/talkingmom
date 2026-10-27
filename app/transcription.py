@@ -422,65 +422,96 @@ _POLISH_SYS = (
 )
 
 
+# Long meetings go to GPT in parts: one huge request can come back cut off,
+# silently losing lines. Each part also sees the lines just before it.
+_CHUNK_LINES = 40
+_CONTEXT_LINES = 4
+
+_ALT_RULES = (
+    "\n\nSome lines are followed by 'ALT:' — a second, independent transcript of the SAME "
+    "words from a different speech recognizer (the video-call's live captions). Use it as "
+    "evidence: where the main line has a word or phrase that makes no sense in context and "
+    "ALT has a sensible one, take ALT's version. Where both make sense, keep the main line. "
+    "ALT may be cut short or merge neighbouring speakers — never copy extra sentences from it. "
+    "Output only the corrected main lines."
+)
+
+
+def _parse_numbered(raw: str) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for line in raw.splitlines():
+        m = re.match(r"^\s*\[(\d+)\]\s*(.*)$", line)
+        if m:
+            out[int(m.group(1))] = m.group(2).strip()
+    return out
+
+
+def _context(texts: list[str], start: int) -> str:
+    prev = texts[max(0, start - _CONTEXT_LINES):start]
+    return ("EARLIER LINES (context only — do not output them):\n" + "\n".join(prev) + "\n\n") if prev else ""
+
+
 def gpt_polish_batch(
-    texts: list[str], language: str | None, names: list[str] | None = None
+    texts: list[str], language: str | None, names: list[str] | None = None,
+    alts: list[str] | None = None,
 ) -> list[str]:
-    """Clean up ASR errors in a batch of same-language transcript lines via GPT."""
+    """Clean up ASR errors in same-language transcript lines via GPT.
+
+    alts: optional second transcript per line (e.g. Google Meet captions) used
+    as evidence for mis-heard words.
+    """
     if not texts or not OPENAI_API_KEY:
         return texts
     src_name = _LANG_FULL.get((language or "").lower(), "the original language")
-    numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(texts))
     system = _POLISH_SYS.format(src=src_name)
     if names:
         system += (
             "\n\nKnown participant names (spell exactly like this when a similar-"
             f"sounding word is clearly a name): {', '.join(names[:30])}"
         )
-    raw = llm_chat(
-        "polish",
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": numbered},
-        ],
-        temperature=0.1,
-    )
-    out: dict[int, str] = {}
-    for line in raw.splitlines():
-        m = re.match(r"^\s*\[(\d+)\]\s*(.*)$", line)
-        if m:
-            out[int(m.group(1))] = m.group(2).strip()
-    return [out.get(i + 1, texts[i]) for i in range(len(texts))]
+    use_alts = bool(alts) and any(alts)
+    if use_alts:
+        system += _ALT_RULES
+    fixed = list(texts)
+    for a in range(0, len(texts), _CHUNK_LINES):
+        part = texts[a:a + _CHUNK_LINES]
+        rows = []
+        for i, t in enumerate(part):
+            rows.append(f"[{i + 1}] {t}")
+            alt = (alts[a + i] if use_alts else "") or ""
+            if alt.strip() and alt.strip() != t.strip():
+                rows.append(f"    ALT: {alt.strip()}")
+        user = _context(texts, a) + "LINES TO CORRECT:\n" + "\n".join(rows)
+        out = _parse_numbered(llm_chat("polish", [{"role": "system", "content": system},
+                                                  {"role": "user", "content": user}], temperature=0.1))
+        for i in range(len(part)):
+            if out.get(i + 1) is not None:
+                fixed[a + i] = out[i + 1]
+    return fixed
 
 
 def gpt_translate_batch(texts: list[str], language: str | None) -> list[str]:
-    """Translate many segments in one call. Gives GPT the full meeting context and
-    produces far more coherent English than per-segment calls."""
+    """Translate many segments, a part at a time with preceding lines as
+    context — coherent English without losing lines on long meetings."""
     if not texts:
         return []
     src_name = _LANG_FULL.get((language or "").lower(), "the original language")
-    numbered = "\n".join(f"[{i+1}] {t}" for i, t in enumerate(texts))
     sys = (
         _TRANSLATE_SYS.format(src=src_name)
         + "\n\nYou will receive numbered lines like [1] ..., [2] ...\n"
         "Return the SAME numbering, one translation per line, in the SAME order.\n"
-        "Do not merge, split, reorder, or drop any line.\n"
+        "Do not merge, split, reorder, or drop any line. Translate only the numbered lines.\n"
         "Format each output line EXACTLY as: [N] english translation"
     )
-    raw = llm_chat(
-        "translate",
-        [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": numbered},
-        ],
-        temperature=0.2,
-    )
-    # Parse [N] lines back into a dict, tolerant of blank lines.
-    out: dict[int, str] = {}
-    for line in raw.splitlines():
-        m = re.match(r"^\s*\[(\d+)\]\s*(.*)$", line)
-        if m:
-            out[int(m.group(1))] = m.group(2).strip()
-    return [out.get(i + 1, "") for i in range(len(texts))]
+    result = [""] * len(texts)
+    for a in range(0, len(texts), _CHUNK_LINES):
+        part = texts[a:a + _CHUNK_LINES]
+        user = _context(texts, a) + "LINES TO TRANSLATE:\n" + "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(part))
+        out = _parse_numbered(llm_chat("translate", [{"role": "system", "content": sys},
+                                                     {"role": "user", "content": user}], temperature=0.2))
+        for i in range(len(part)):
+            result[a + i] = out.get(i + 1, "")
+    return result
 
 
 def detect_language_prob(wav: np.ndarray) -> tuple[str | None, float]:

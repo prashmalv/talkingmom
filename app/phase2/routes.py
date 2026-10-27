@@ -172,7 +172,7 @@ def _room_or_404(code: str) -> dict:
 @router.post("/rooms")
 def create_room(payload: dict = Body(...)):
     """Body: {title, language, translate, meet_url?}. With meet_url, the
-    'MoM Assistant' bot joins that Google Meet instead of devices joining."""
+    'AI Assistant' bot joins that Google Meet instead of devices joining."""
     meet_url = (payload.get("meet_url") or "").strip() or None
     if meet_url:
         from .meet_bot import valid_meet_url

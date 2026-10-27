@@ -397,8 +397,9 @@ def _process_meet(room: dict, jid: str) -> None:
                 log(f"✓ Whisper done in {time.time() - t1:.1f}s — {len(stt['res']['words'])} words")
             except Exception as e:
                 stt["err"] = e
-            segments = build_transcript(wav, TARGET_SR, turns, stt, room["language"], room["translate"],
-                                        names, log, _p, t1)
+            segments = build_transcript(
+                wav, TARGET_SR, turns, stt, room["language"], room["translate"], names, log, _p, t1,
+                alt_for=lambda s: bot.caption_text_for(s["start"], s["end"], s["speaker"]))
         else:
             # Captions never came on (or nobody spoke): fall back to voice recognition.
             log("No caption speaker names were captured — falling back to voice recognition")

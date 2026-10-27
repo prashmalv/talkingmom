@@ -330,12 +330,14 @@ def process_meeting(
 
 
 def build_transcript(wav: np.ndarray, sr: int, turns: list[dict], stt: dict, language: str | None,
-                     translate: bool, names: list[str], log, _p, t0: float) -> list[dict]:
+                     translate: bool, names: list[str], log, _p, t0: float, alt_for=None) -> list[dict]:
     """Turn named speaker turns + Whisper words into finished transcript lines.
 
     Shared by uploaded meetings (turns from diarization + voice ID) and Phase 2
     meeting rooms (turns from each participant's own microphone). `turns` need
     start/end/speaker/name; `stt` is {"res": transcribe_words(...)} or {"err": e}.
+    alt_for(segment) -> str: optional second transcript of the same moment
+    (Google Meet's captions) that GPT uses as evidence when fixing words.
     """
     duration = len(wav) / sr
     if "err" in stt:
@@ -398,9 +400,13 @@ def build_transcript(wav: np.ndarray, sr: int, turns: list[dict], stt: dict, lan
         _p(91, "polishing")
         for lang, indices in by_lang_pre.items():
             texts = [segments[i]["text"] for i in indices]
+            # Meet captions are English: only a useful second opinion for English lines.
+            alts = [alt_for(segments[i]) for i in indices] if alt_for and lang == "en" else None
+            how = " + Meet captions as second opinion" if alts and any(alts) else ""
             try:
-                with log.step(f"Step 5 — Fix mis-heard words ({len(indices)} {lang} lines, {model_label('polish')})"):
-                    fixed = gpt_polish_batch(texts, lang, names=names)
+                with log.step(f"Step 5 — Fix mis-heard words ({len(indices)} {lang} lines, "
+                              f"{model_label('polish')}{how})"):
+                    fixed = gpt_polish_batch(texts, lang, names=names, alts=alts)
                     changed = sum(1 for a, b in zip(texts, fixed) if b and a != b)
                     log(f"  {changed} of {len(indices)} lines corrected")
                 for i, t in zip(indices, fixed):

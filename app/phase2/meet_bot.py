@@ -1,4 +1,4 @@
-"""Google Meet bot: joins a call as "MoM Assistant", records it, and reads
+"""Google Meet bot: joins a call as "AI Assistant", records it, and reads
 Meet's own live captions to learn WHO spoke WHEN (names = Meet accounts).
 
 How it works
@@ -29,7 +29,7 @@ import uuid
 
 from ..config import BASE_DIR
 
-BOT_NAME = "MoM Assistant"
+BOT_NAME = "AI Assistant"
 # Google blocks guests without an account from meetings hosted by personal
 # accounts ("You can't join this video call"). So the bot uses a Chrome
 # profile signed in to a Google account — the person signs in once by hand
@@ -75,9 +75,12 @@ _INIT_JS = r"""
 (() => {
   const Orig = window.RTCPeerConnection;
   if (!Orig || Orig.__mom) return;
-  window.__momTracks = [];
+  window.__momTracks = [];      // source A: incoming WebRTC audio tracks
+  window.__momPCs = [];         // peer connections, for "is audio arriving?" stats
+  window.__momElStreams = [];   // source B: streams Meet attaches to its <audio>/<video> players
   function Wrapped(...args) {
     const pc = new Orig(...args);
+    window.__momPCs.push(pc);
     pc.addEventListener('track', (e) => {
       if (e.track && e.track.kind === 'audio') {
         window.__momTracks.push(e.track);
@@ -90,32 +93,138 @@ _INIT_JS = r"""
   Object.setPrototypeOf(Wrapped, Orig);
   Wrapped.__mom = true;
   window.RTCPeerConnection = Wrapped;
+  // Source D: Meet plays voices through Web Audio (no <audio> elements at
+  // all). Every node connected to a context's speakers is also connected to
+  // a recording tap in that same context, so we get exactly what is played.
+  window.__momTaps = [];
+  const origConnect = AudioNode.prototype.connect;
+  AudioNode.prototype.connect = function (dst, ...rest) {
+    try {
+      if (dst instanceof AudioDestinationNode && !this.context.__momOwn && this.context.createMediaStreamDestination) {
+        const c = this.context;
+        if (!c.__momTap) {
+          c.__momTap = c.createMediaStreamDestination();
+          window.__momTaps.push(c.__momTap.stream);
+          if (window.__momOnTap) window.__momOnTap(c.__momTap.stream);
+        }
+        origConnect.call(this, c.__momTap);
+      }
+    } catch (e) {}
+    return origConnect.call(this, dst, ...rest);
+  };
+  // Whatever stream Meet hands to a media element is what people hear.
+  const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+  if (desc && desc.set) {
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+      configurable: true, get: desc.get,
+      set(v) {
+        try {
+          if (v && !this.__momOwn && v.getAudioTracks && v.getAudioTracks().length) {  // skip the bot's own helper players
+            window.__momElStreams.push(v);
+            if (window.__momOnElStream) window.__momOnElStream(v, this);
+          }
+        } catch (e) {}
+        return desc.set.call(this, v);
+      },
+    });
+  }
 })();
 """
 
 _START_REC_JS = r"""
 async () => {
-  // Mix every incoming WebRTC audio track (each participant's voice) with Web
-  // Audio. Chrome quirk: a remote track feeds Web Audio only while it is also
-  // attached to a media element — without that the recording is pure silence.
-  // (Tab capture is no use here: with the fake mic/camera flags Chrome hands
-  // back its own test beep instead of the tab's sound.)
+  // Meet's audio can reach the page in different ways, and some of them give
+  // Web Audio pure silence in Chrome. So everything is mixed together, and a
+  // per-source level meter reports which source really carries sound:
+  //   A  incoming WebRTC tracks (each also attached to a muted <audio> — a
+  //      remote track only feeds Web Audio while a media element plays it)
+  //   B  the streams Meet attaches to its own players (what people hear)
+  //   C  captureStream() of Meet's playing <audio> elements
+  // (Tab capture is no use: with the fake mic/camera flags Chrome returns its
+  // own test beep instead of the tab's sound.)
   const ctx = new AudioContext();
+  ctx.__momOwn = true;  // our own graph is never tapped
   try { await ctx.resume(); } catch (e) {}
   const dest = ctx.createMediaStreamDestination();
   const seen = new Set();
   window.__momKeep = [];
-  const add = (t) => {
-    if (seen.has(t.id)) return; seen.add(t.id);
-    const ms = new MediaStream([t]);
-    const el = new Audio(); el.srcObject = ms; el.muted = true; el.play().catch(() => {});
-    window.__momKeep.push(el);
-    try { ctx.createMediaStreamSource(ms).connect(dest); } catch (e) {}
+  window.__momSources = [];   // {kind, id, analyser}
+  const meter = (node, kind, id) => {
+    const an = ctx.createAnalyser(); an.fftSize = 1024; node.connect(an);
+    window.__momSources.push({ kind, id, an, buf: new Float32Array(an.fftSize) });
   };
-  window.__momTracks.forEach(add);
-  window.__momOnTrack = add;
+  // One gain per source KIND. The same voices can arrive through A, B and C
+  // at once; summing them all would clip. Every second the kind carrying the
+  // most sound is switched in and the others muted (sources within a kind —
+  // different speakers — are still mixed).
+  const kindGain = {};
+  for (const k of ['A', 'B', 'C', 'D']) {
+    kindGain[k] = ctx.createGain(); kindGain[k].gain.value = k === 'A' ? 1 : 0; kindGain[k].connect(dest);
+  }
+  window.__momActive = 'A';
+  const avg = { A: 0, B: 0, C: 0, D: 0 };
+  const addStream = (ms, kind, id) => {
+    if (seen.has(kind + id)) return; seen.add(kind + id);
+    try {
+      const node = ctx.createMediaStreamSource(ms);
+      node.connect(kindGain[kind]); meter(node, kind, id);
+    } catch (e) {}
+  };
+  window.__momPick = setInterval(() => {
+    const now = { A: 0, B: 0, C: 0, D: 0 };
+    for (const s of window.__momSources) {
+      s.an.getFloatTimeDomainData(s.buf); let q = 0; for (const v of s.buf) q += v * v;
+      now[s.kind] += Math.sqrt(q / s.buf.length);
+    }
+    let best = window.__momActive;
+    for (const k of ['A', 'B', 'C', 'D']) { avg[k] = 0.8 * avg[k] + 0.2 * now[k]; if (avg[k] > avg[best] * 1.5 + 1e-4) best = k; }
+    if (best !== window.__momActive) {
+      for (const k of ['A', 'B', 'C', 'D']) kindGain[k].gain.setTargetAtTime(k === best ? 1 : 0, ctx.currentTime, 0.05);
+      window.__momActive = best;
+    }
+  }, 1000);
+  const addTrack = (t) => {
+    const ms = new MediaStream([t]);
+    const el = new Audio(); el.__momOwn = true; el.srcObject = ms; el.muted = true; el.play().catch(() => {});
+    window.__momKeep.push(el);
+    addStream(ms, 'A', t.id);
+  };
+  const addEl = (ms) => addStream(ms, 'B', ms.id);
+  const addCapture = (el) => {
+    try {
+      if (!el.captureStream || el.__momCap) return;
+      const cs = el.captureStream();
+      if (cs.getAudioTracks().length) { el.__momCap = true; addStream(cs, 'C', cs.id); }
+    } catch (e) {}
+  };
+  window.__momTracks.forEach(addTrack);   window.__momOnTrack = addTrack;
+  window.__momElStreams.forEach(addEl);   window.__momOnElStream = (ms, el) => { addEl(ms); setTimeout(() => addCapture(el), 500); };
+  window.__momTaps.forEach(ts => addStream(ts, 'D', ts.id));
+  window.__momOnTap = (ts) => addStream(ts, 'D', ts.id);
+  const scan = () => document.querySelectorAll('audio, video').forEach(el => { if (!el.__momOwn) addCapture(el); });
+  scan(); window.__momScan = setInterval(scan, 3000);
   const stream = dest.stream;
-  const how = 'call audio (' + seen.size + ' stream(s))';
+  const how = `mixed call audio (${window.__momTracks.length} call tracks, ` +
+              `${window.__momElStreams.length} player streams, ${window.__momTaps.length} Web Audio taps)`;
+  // Per-source levels + whether audio is arriving over the network at all.
+  window.__momDiag = async () => {
+    const lv = (s) => { s.an.getFloatTimeDomainData(s.buf); let q = 0; for (const v of s.buf) q += v * v; return Math.sqrt(q / s.buf.length); };
+    const sources = window.__momSources.map(s => s.kind + ':' + lv(s).toFixed(4));
+    let bytes = 0, energy = 0, inbound = 0;
+    for (const pc of window.__momPCs) {
+      try {
+        (await pc.getStats()).forEach(r => {
+          if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+            inbound++; bytes += r.bytesReceived || 0; energy += r.totalAudioEnergy || 0;
+          }
+        });
+      } catch (e) {}
+    }
+    const els = [...document.querySelectorAll('audio')].map(a => (a.paused ? 'paused' : 'playing') + (a.muted ? '/muted' : ''));
+    const tracks = window.__momTracks.map(t => t.readyState + (t.muted ? '/muted' : '') + (t.enabled ? '' : '/disabled'));
+    return { recording_from: window.__momActive, sources, inbound, bytesReceived: bytes,
+             audioEnergy: +energy.toFixed(4), audioEls: els, tracks, ctx: ctx.state };
+  };
   // Level meter so Python can tell real sound from silence.
   const an = ctx.createAnalyser(); an.fftSize = 2048;
   ctx.createMediaStreamSource(stream).connect(an);
@@ -362,7 +471,7 @@ class MeetBot(threading.Thread):
             self.error = "Couldn't find Meet's “Ask to join” button."
             self._set("error", self.error)
             return
-        self._set("waiting_admit", "Asked to join — the host must click Admit for “MoM Assistant” in Meet")
+        self._set("waiting_admit", f"Asked to join — the host must click Admit for “{BOT_NAME}” in Meet")
         deadline = time.time() + 300
         while time.time() < deadline and not self._stop.is_set():
             if self._in_call(page):
@@ -420,9 +529,14 @@ class MeetBot(threading.Thread):
             if time.time() - last_snapshot > 15:
                 last_snapshot = time.time()
                 try:
+                    diag = page.evaluate("async () => window.__momDiag ? await window.__momDiag() : null")
+                except Exception as e:
+                    diag = {"error": str(e)[:120]}
+                print(f"  [meet-bot {self.room_code}] audio check: {diag}", flush=True)
+                try:
                     outline = page.evaluate(_CAPTION_SNAPSHOT_JS)
                     with open(debug_file, "a", encoding="utf-8") as f:
-                        f.write(f"===== {time.strftime('%H:%M:%S')} parsed: {blocks}\n{outline}\n")
+                        f.write(f"===== {time.strftime('%H:%M:%S')} AUDIO {diag}\nparsed: {blocks}\n{outline}\n")
                 except Exception:
                     pass
             if time.time() - last_level_check > 2:
@@ -464,6 +578,23 @@ class MeetBot(threading.Thread):
         self._set("left", f"Left the meeting — {self.chunks * 3}s recorded, {len(self.utterances)} caption turns")
 
     # ---------------------------------------------------------- results
+    def caption_text_for(self, start: float, end: float, speaker: str) -> str:
+        """What Meet's captions showed for this speaker during [start, end]
+        (recording timeline) — a second opinion on Whisper's words."""
+        if self.audio_start is None:
+            return ""
+        with self._lock:
+            utts = list(self.utterances)
+        parts = []
+        for u in utts:
+            if u["name"] != speaker:
+                continue
+            us = u["start"] - self.audio_start - CAPTION_LAG_S - 0.8
+            ue = u["end"] - self.audio_start - CAPTION_LAG_S + 0.4
+            if us < end + 1.0 and ue > start - 1.0:
+                parts.append(u["text"])
+        return " ".join(parts)
+
     def speaker_turns(self) -> list[dict]:
         """Caption utterances → turns on the recording's timeline (seconds)."""
         if self.audio_start is None:
